@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["dnom", "dnom-common", "dnom-ebpf"]
+default-members = ["dnom", "dnom-common"]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+edition = "2024"
+
+[workspace.dependencies]
+aya = { version = "0.14.0", default-features = false }
+aya-build = { version = "0.2.0", default-features = false }
+aya-ebpf = { version = "0.2.1", default-features = false }
+
+anyhow = { version = "1", default-features = true }
+cargo_metadata = { version = "0.23.0", default-features = false }
+clap = { version = "4.5.20", features = ["derive"] }
+humantime = "2"
+libc = "0.2.159"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = "2.1"
+tokio = { version = "1.53.3", default-features = false }
+ureq = { version = "3", features = ["json"] }
+which = { version = "6.0.0", default-features = false }
+
+[profile.release.package.dnom-ebpf]
+debug = 2
+codegen-units = 1
+strip = false

@@ -1,0 +1,33 @@
+{"ts_ms": 1794190696149, "pid": 4200001, "tid": 4200001, "uid": 1000, "comm": "foot", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/foot", "argv": ["foot"]}
+{"ts_ms": 1794190696150, "pid": 4200001, "tid": 4200001, "uid": 1000, "comm": "foot", "cgroup": 1, "kind": "fork", "child": 4200002}
+{"ts_ms": 1794190696151, "pid": 4200002, "tid": 4200002, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/bash", "argv": ["/usr/bin/bash"]}
+{"ts_ms": 1794190697149, "pid": 4200002, "tid": 4200002, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4200003}
+{"ts_ms": 1794190697150, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "fake-lateral.sh", "cgroup": 1, "kind": "exec", "exe": "./scripts/fake-lateral.sh", "argv": ["./scripts/fake-lateral.sh"]}
+{"ts_ms": 1794190697151, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/bash", "argv": ["bash", "./scripts/fake-lateral.sh"]}
+{"ts_ms": 1794190697269, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.1:22"}
+{"ts_ms": 1794190697289, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.2:22"}
+{"ts_ms": 1794190697309, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.3:22"}
+{"ts_ms": 1794190697329, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.4:22"}
+{"ts_ms": 1794190697349, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.5:22"}
+{"ts_ms": 1794190697369, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.6:22"}
+{"ts_ms": 1794190697389, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.7:22"}
+{"ts_ms": 1794190697409, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.8:22"}
+{"ts_ms": 1794190697429, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.9:22"}
+{"ts_ms": 1794190697449, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.10:22"}
+{"ts_ms": 1794190697469, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.11:22"}
+{"ts_ms": 1794190697489, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.12:22"}
+{"ts_ms": 1794190697509, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.13:22"}
+{"ts_ms": 1794190697529, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.14:22"}
+{"ts_ms": 1794190697549, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.15:22"}
+{"ts_ms": 1794190697569, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.16:22"}
+{"ts_ms": 1794190697589, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.17:22"}
+{"ts_ms": 1794190697609, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.18:22"}
+{"ts_ms": 1794190697629, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.19:22"}
+{"ts_ms": 1794190697649, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.20:22"}
+{"ts_ms": 1794190697749, "pid": 4200003, "tid": 4200003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4200004}
+{"ts_ms": 1794190697750, "pid": 4200004, "tid": 4200004, "uid": 1000, "comm": "ssh", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/ssh", "argv": ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "deploy@10.0.0.12", "uname -a; id; cat /etc/passwd"]}
+{"ts_ms": 1794190697751, "pid": 4200004, "tid": 4200004, "uid": 1000, "comm": "ssh", "cgroup": 1, "kind": "open", "path": "/home/iluxa/.ssh/config", "flags": 0, "write": false}
+{"ts_ms": 1794190697752, "pid": 4200004, "tid": 4200004, "uid": 1000, "comm": "ssh", "cgroup": 1, "kind": "open", "path": "/home/iluxa/.ssh/id_ed25519", "flags": 0, "write": false}
+{"ts_ms": 1794190697753, "pid": 4200004, "tid": 4200004, "uid": 1000, "comm": "ssh", "cgroup": 1, "kind": "open", "path": "/home/iluxa/.ssh/known_hosts", "flags": 0, "write": false}
+{"ts_ms": 1794190697754, "pid": 4200004, "tid": 4200004, "uid": 1000, "comm": "ssh", "cgroup": 1, "kind": "net", "op": "connect", "dest": "10.0.0.12:22"}
+{"ts_ms": 1794190716149, "pid": 4200001, "tid": 4200001, "uid": 1000, "comm": "foot", "cgroup": 1, "kind": "open", "path": "/home/iluxa/.config/foot/foot.ini", "flags": 0, "write": false}

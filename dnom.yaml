@@ -1,0 +1,65 @@
+# dnom classify config. Policies (SPEC §4.5) will be added here later.
+
+# Process trees that are not sent to the model.
+# A rule matches when every field it sets matches; it covers that process and
+# everything it starts. Fields: exe (exact path), exe_prefix, comm (process
+# name, weak: any program can pick its own), argv_contains.
+# Sensitive file access (credentials, persistence, system binaries) inside an
+# ignored tree is still assessed and flagged sensitive_in_ignored_tree, so a
+# program can't hide by matching a rule.
+ignore:
+  - name: omaestro
+    exe_prefix: /home/iluxa/.local/share/omaestro/
+
+# A process whose parent has one of these names starts its own episode.
+# A shell started directly by one of these counts as interactive: each command
+# typed in it is its own episode.
+boundaries:
+  - systemd
+  - init
+  - sshd
+  - sshd-session
+  - login
+  - cron
+  - crond
+  - "tmux: server"
+  - zellij
+  - foot
+  - alacritty
+  - kitty
+  - ghostty
+  - wezterm-gui
+  - Hyprland
+  - start-hyprland
+  - uwsm
+  - quickshell
+  - desl
+
+# File categories: custom lists extend built-ins by default.
+# Literal, case-sensitive strings, NOT globs or regex. No ~ expansion.
+# credentials/persistence match anywhere in a path; system_binaries/temp match prefixes.
+# Persistence and system-binary categories apply only to write opens.
+# Credential paths ending in .pub are excluded; precedence is credentials, persistence,
+# system_binaries, temp. These classify paths; they do not mask them in outbound data.
+# Kernel noise filters still run first (including /proc); these rules cannot undo them.
+paths:
+  include_defaults: true   # false uses only the lists below for all four categories
+  credentials: []         # e.g. ["/etc/myapp/session", "/.config/myapp/session"]
+  persistence: []         # e.g. ["/etc/myapp/startup/"]
+  system_binaries: []     # e.g. ["/opt/myapp/bin/"]
+  temp: []                # e.g. ["/scratch/"]
+
+# Mask argument values before storing episodes or sending them to Jev.
+# Name fragments, exact names, flags, and headers are case-insensitive.
+# Token prefixes are case-sensitive (custom prefixes have no minimum token length).
+# Only NAME=value arguments are inspected; process environments are not collected.
+redact:
+  include_defaults: true   # false replaces built-in lists; URL/Bearer/program rules remain
+  secret_names: []         # exact names, e.g. ["MYAPP_SESSION"]
+  secret_name_parts: []    # name fragments, e.g. ["PRIVATE"]
+  secret_flag_words: []    # flag fragments without --, e.g. ["session"]
+  secret_headers: []       # exact header names, e.g. ["X-Company-Session"]
+  token_prefixes: []       # e.g. ["company_"]
+
+# Restart classify (or make run) after editing. Empty strings and unknown settings are errors.
+# Redaction remains best effort: embedded shell scripts and unlabelled secrets can escape it.

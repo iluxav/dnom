@@ -1,0 +1,10 @@
+/target
+
+# Secrets
+.env
+
+# Raw recordings of real host activity (make record)
+/lab/recordings/
+
+# Personal Claude Code settings
+.claude/settings.local.json

