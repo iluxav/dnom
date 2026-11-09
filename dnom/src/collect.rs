@@ -354,11 +354,12 @@ fn decode_data(hdr: &Header, bytes: &[u8]) -> Option<Data> {
                 return None;
             }
             let write = rec.flags & 0o3 != 0 || rec.flags & (0o100 | 0o1000) != 0;
-            Data::Open {
-                path: resolve_open_path(hdr.tid, rec.dfd, &raw),
-                flags: rec.flags,
-                write,
+            let path = resolve_open_path(hdr.tid, rec.dfd, &raw);
+            // The kernel filtered `raw`; a relative path is only known in full here.
+            if !raw.starts_with('/') && is_noise_path(&path, write) {
+                return None;
             }
+            Data::Open { path, flags: rec.flags, write }
         }
         KIND_NET => {
             let rec: Net = read_record(bytes)?;
@@ -374,6 +375,12 @@ fn decode_data(hdr: &Header, bytes: &[u8]) -> Option<Data> {
         }
         _ => return None,
     })
+}
+
+/// Userspace copy of the kernel's open filter, for paths it could only see relative.
+fn is_noise_path(path: &str, write: bool) -> bool {
+    let p = path.as_bytes();
+    NOISE_ALWAYS.iter().any(|n| p.starts_with(n)) || (!write && NOISE_READ.iter().any(|n| p.starts_with(n)))
 }
 
 const AT_FDCWD: i32 = -100;
@@ -560,6 +567,39 @@ mod tests {
         // An exit record without a held exec (exec before the collector started) is ignored.
         dec.feed(&args(KIND_EXEC_ARGS_DONE, 10, 10, &["x"]), &clock, &mut out);
         assert!(out.is_empty());
+    }
+
+    fn open_rec(tid: u32, dfd: i32, path: &str, flags: i32) -> Vec<u8> {
+        let mut rec = Open { hdr: header(KIND_OPEN, tid, tid), flags, dfd, filename: [0; PATH_LEN] };
+        rec.filename[..path.len()].copy_from_slice(path.as_bytes());
+        record_bytes(&rec)
+    }
+
+    /// procps reads `<pid>/stat` relative to a `/proc` directory handle: the kernel can't
+    /// filter it, so it is dropped after resolution. Ordinary relative opens are kept.
+    #[test]
+    fn relative_noise_dropped_after_resolution() {
+        let clock = Clock::new();
+        let me = std::process::id();
+        let proc_dir = File::open("/proc").unwrap();
+        let usr_dir = File::open("/usr").unwrap();
+        let tmp_dir = File::open("/tmp").unwrap();
+        let mut dec = Decoder::default();
+        let mut out = Vec::new();
+        dec.feed(&open_rec(me, proc_dir.as_raw_fd(), "self/stat", 0), &clock, &mut out);
+        dec.feed(&open_rec(me, usr_dir.as_raw_fd(), "lib/os-release", 0), &clock, &mut out);
+        assert!(out.is_empty(), "noise: {:?}", out.iter().map(|e| &e.data).collect::<Vec<_>>());
+        // A write under /usr/lib is not noise; neither is an ordinary relative path.
+        dec.feed(&open_rec(me, usr_dir.as_raw_fd(), "lib/x", 0o1 | 0o100), &clock, &mut out);
+        dec.feed(&open_rec(me, tmp_dir.as_raw_fd(), "dnom-x", 0), &clock, &mut out);
+        let paths: Vec<_> = out
+            .iter()
+            .map(|e| match &e.data {
+                Data::Open { path, .. } => path.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(paths, ["/usr/lib/x", "/tmp/dnom-x"]);
     }
 
     #[test]

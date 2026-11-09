@@ -68,6 +68,9 @@ opens = [e for e in events if e["kind"] == "open"]
 ordinary = f"{vmdir}/ordinary.txt"
 check("ordinary file write and read captured",
       all(any(e["path"] == ordinary and e["write"] == w for e in opens) for w in (True, False)), ordinary)
+noise = [e for e in opens if e["path"].startswith(("/proc/", "/sys/"))]
+check("no /proc or /sys opens reported (incl. relative to a directory handle, as procps does)",
+      not noise, {"noise_opens": len(noise), "by": sorted({e["comm"] for e in noise})[:5]})
 missing = f"{vmdir}/does-not-exist.txt"
 tried = any(e["kind"] == "exec" and missing in e["argv"] for e in events)
 check("failed open is not reported", tried and not any(e["path"] == missing for e in opens),

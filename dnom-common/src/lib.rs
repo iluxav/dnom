@@ -24,6 +24,33 @@ pub const NET_OP_SENDTO: u32 = 2;
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
 
+/// Opens that are never reported, whatever the flags. Checked in the kernel on the path as
+/// passed to open, and again in userspace once a relative path is resolved (the kernel only
+/// sees `<pid>/stat` when procps opens it relative to a `/proc` directory handle).
+pub const NOISE_ALWAYS: [&[u8]; 9] = [
+    b"/proc/",
+    b"/sys/",
+    b"/dev/null",
+    b"/dev/tty",
+    b"/dev/pts/",
+    b"/dev/urandom",
+    b"/dev/random",
+    b"/dev/dri/",
+    b"/dev/nvidia",
+];
+
+/// Opens never reported when read-only (libraries, fonts, icons, loader cache).
+pub const NOISE_READ: [&[u8]; 8] = [
+    b"/usr/lib",
+    b"/lib",
+    b"/usr/share/",
+    b"/usr/local/lib",
+    b"/etc/ld.so",
+    b"/etc/fonts/",
+    b"/var/cache/fontconfig/",
+    b"/usr/libexec/",
+];
+
 /// Indexes into the `CONFIG` array map, filled by userspace before attaching.
 pub const CFG_OWN_TGID: u32 = 0;
 /// Offset of `__data_loc char[] filename` in `sched:sched_process_exec`.

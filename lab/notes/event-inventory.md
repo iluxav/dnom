@@ -1,11 +1,11 @@
 # Event inventory (lab, 2026-11-08)
 
 What dnom's sensor records, how much of it, and what the lab runs found. Reproduce with
-`make vm-start && make vm-e2e` (31 checks; results in `~/.local/state/dnom/vm-e2e/`).
+`make vm-start && make vm-e2e` (32 checks; results in `~/.local/state/dnom/vm-e2e/`).
 
 - **VM:** Ubuntu 26.04, kernel 7.0.0-38-generic, 4 vCPU, 8 GB, BPF LSM on (`lab/vm`).
 - **Host:** Arch (Omarchy), kernel 7.2.15.
-- **dnom:** commit 4550299 plus the exec-arguments fix (finding 3).
+- **dnom:** commit 150d01a plus the `/proc` noise fix (finding 7).
 
 ## 1. Sensors and events
 
@@ -28,6 +28,8 @@ Every event carries `ts_ms`, `pid`, `tid`, `uid`, `comm` and `cgroup`. Per kind:
 
 Dropped in the kernel: opens under `/proc/` and `/sys/`, `/dev/null`, ttys and other device
 noise, read-only opens of libraries, fonts and shared data, and directory and `O_PATH` opens.
+The same path lists (`dnom-common`) are applied again in userspace to relative paths once
+they're resolved, since the kernel only sees the relative part.
 
 | Ring buffer record | Bytes |
 |---|---|
@@ -44,12 +46,13 @@ The ring buffer is 16 MiB. A JSON event line averages about 145 bytes.
 | Situation | Events | Notes |
 |---|---|---|
 | VM idle, 30 s | **0** | only the 57-line startup snapshot |
-| VM under the e2e workload (round 1) | **3,222 in 13.1 s, ≈ 250/s** | open 1,436, fork 600, exec 593, exit 561, net 32 |
+| VM under the e2e workload (round 1) | **2,619 in 13.0 s, ≈ 200/s** | open 833, fork 600, exec 593, exit 561, net 32 |
 | e2e, every round | **0 dropped** | the reported count equals the lines written |
 | Desktop, earlier sensor (before the fixes) | ≈ 13/s | about 200 per 15 s status line; not remeasured |
 | Falco catch-all rules on the desktop | ≈ 57/s | about 2,550 in 45 s; Falco's own filters |
 
-596 of the 1,436 opens in the e2e round are `/proc` noise from one `pkill` (finding 7).
+Before the finding 7 fix, the same round had 3,222 events, 1,436 of them opens: 596 were
+`/proc` reads by the one `pkill` that stops the collector.
 
 Model calls are far fewer than events: only episodes that pass the pre-filter are sent. Jev
 answered in 120–200 ms per episode, about 1.4k input tokens each.
@@ -64,7 +67,7 @@ answered in 120–200 ms per episode, about 1.4k input tokens each.
 | 4 | A script started over SSH (`bash -c` exec'ing into the script) counted as an interactive shell | its children split into separate episodes | fixed (a749b0d) |
 | 5 | sshd `connect()`s to `0.0.0.0:22` and `[::]:22` on every login | false "new destination" rule match per login | fixed: this machine's own addresses are never new (a749b0d) |
 | 6 | `classify` assessed only 4 episodes (the per-tick budget) when its input ended | 33 of 37 episodes silently dropped | fixed (4550299) |
-| 7 | Opens relative to a directory handle skip the kernel noise filter. procps tools (pkill, ps, top) open `<pid>/stat` relative to `/proc`, so the prefix check never sees `/proc/` | 41% of the opens in an e2e round are `/proc` noise | **open**: drop resolved `/proc` and `/sys` paths in userspace |
+| 7 | Opens relative to a directory handle skip the kernel noise filter. procps tools (pkill, ps, top) open `<pid>/stat` relative to `/proc`, so the prefix check never sees `/proc/` | 41% of the opens in an e2e round were `/proc` noise | fixed: the noise lists are applied again in userspace after resolution; e2e checks no `/proc` or `/sys` open is reported |
 | 8 | Desktop runs: ssh probes 12 key names (failed opens counted as reads); `mkdir -p` relative paths went stale after a fast `chdir` | inflated credential scores; wrong paths | fixed: opens reported only on success; directory opens dropped |
 
 ## 4. Not visible yet

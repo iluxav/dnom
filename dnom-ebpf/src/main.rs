@@ -67,30 +67,6 @@ const O_TRUNC: i32 = 0o1000;
 const O_DIRECTORY: i32 = 0o200000;
 const O_PATH: i32 = 0o10000000;
 
-/// Opens dropped in the kernel whatever the flags.
-const NOISE_ALWAYS: [&[u8]; 9] = [
-    b"/proc/",
-    b"/sys/",
-    b"/dev/null",
-    b"/dev/tty",
-    b"/dev/pts/",
-    b"/dev/urandom",
-    b"/dev/random",
-    b"/dev/dri/",
-    b"/dev/nvidia",
-];
-
-/// Opens dropped only when read-only (libraries, fonts, icons, loader cache).
-const NOISE_READ: [&[u8]; 8] = [
-    b"/usr/lib",
-    b"/lib",
-    b"/usr/share/",
-    b"/usr/local/lib",
-    b"/etc/ld.so",
-    b"/etc/fonts/",
-    b"/var/cache/fontconfig/",
-    b"/usr/libexec/",
-];
 
 #[inline(always)]
 fn cfg(index: u32) -> u32 {
