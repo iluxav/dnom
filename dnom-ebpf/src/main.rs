@@ -36,12 +36,28 @@ static OPEN_SCRATCH: PerCpuArray<Open> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static PENDING_OPENS: LruHashMap<u32, Open> = LruHashMap::with_max_entries(16384, 0);
 
-/// `long ret` in syscall exit tracepoints.
+// raw_syscalls:sys_enter is `long id` at 8 and `unsigned long args[6]` at 16;
+// raw_syscalls:sys_exit is `long id` at 8 and `long ret` at 16. Userspace checks these
+// offsets against tracefs before attaching.
+//
+// Why raw_syscalls and not syscalls:sys_enter_<name>: on Ubuntu's 7.0.0-38 kernel the
+// per-syscall tracepoints fired for 2 of 200 execve calls (raw_syscalls: 203 of 200).
+const RAW_ID: usize = 8;
+const SYS_ARG: [usize; 6] = [16, 24, 32, 40, 48, 56];
 const SYS_EXIT_RET: usize = 16;
 
-// Syscall tracepoints: 8-byte common header, 4-byte __syscall_nr, then one 8-byte slot per
-// argument starting at offset 16. Userspace checks these against tracefs before attaching.
-const SYS_ARG: [usize; 6] = [16, 24, 32, 40, 48, 56];
+// x86_64 syscall numbers (userspace refuses to run on other architectures).
+const NR_OPEN: i64 = 2;
+const NR_CONNECT: i64 = 42;
+const NR_SENDTO: i64 = 44;
+const NR_EXECVE: i64 = 59;
+const NR_CREAT: i64 = 85;
+const NR_OPENAT: i64 = 257;
+const NR_EXECVEAT: i64 = 322;
+const NR_OPENAT2: i64 = 437;
+
+const AT_FDCWD: i32 = -100;
+const O_WRONLY: i32 = 0o1;
 
 const O_ACCMODE: i32 = 0o3;
 const O_CREAT: i32 = 0o100;
@@ -152,20 +168,51 @@ fn is_noise(path: &[u8; PATH_LEN], flags: i32) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Process lifecycle
+// Syscall entry / exit: one program each, dispatching on the syscall number
 // ---------------------------------------------------------------------------------------------
 
 #[tracepoint]
-pub fn sys_enter_execve(ctx: TracePointContext) -> u32 {
-    let _ = try_sys_enter_execve(&ctx);
+pub fn raw_sys_enter(ctx: TracePointContext) -> u32 {
+    let Ok(id) = (unsafe { ctx.read_at::<i64>(RAW_ID) }) else { return 0 };
+    let arg = |i: usize| -> u64 { unsafe { ctx.read_at::<u64>(SYS_ARG[i]) }.unwrap_or(0) };
+    let _ = match id {
+        NR_EXECVE => on_execve(arg(1) as *const *const u8),
+        NR_EXECVEAT => on_execve(arg(2) as *const *const u8),
+        NR_OPEN => on_open(AT_FDCWD, arg(0) as *const u8, arg(1) as i32),
+        NR_CREAT => on_open(AT_FDCWD, arg(0) as *const u8, O_CREAT | O_WRONLY | O_TRUNC),
+        NR_OPENAT => on_open(arg(0) as i32, arg(1) as *const u8, arg(2) as i32),
+        NR_OPENAT2 => {
+            // openat2(dfd, filename, struct open_how *how, size): how->flags is the first u64.
+            let flags: u64 = unsafe { bpf_probe_read_user(arg(2) as *const u64) }.unwrap_or(0);
+            on_open(arg(0) as i32, arg(1) as *const u8, flags as i32)
+        }
+        // connect(fd, uservaddr, addrlen)
+        NR_CONNECT => on_net(NET_OP_CONNECT, arg(1) as *const u8),
+        // sendto(fd, buff, len, flags, addr, addr_len): only calls that name a destination.
+        NR_SENDTO => on_net(NET_OP_SENDTO, arg(4) as *const u8),
+        _ => Ok(()),
+    };
     0
 }
 
-fn try_sys_enter_execve(ctx: &TracePointContext) -> Result<(), i32> {
+#[tracepoint]
+pub fn raw_sys_exit(ctx: TracePointContext) -> u32 {
+    let Ok(id) = (unsafe { ctx.read_at::<i64>(RAW_ID) }) else { return 0 };
+    if matches!(id, NR_OPEN | NR_CREAT | NR_OPENAT | NR_OPENAT2) {
+        let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET) }.unwrap_or(-1);
+        on_open_exit(ret);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------------------------
+// Process lifecycle
+// ---------------------------------------------------------------------------------------------
+
+fn on_execve(argv: *const *const u8) -> Result<(), i32> {
     if is_self(current_tgid()) {
         return Ok(());
     }
-    let argv: *const *const u8 = unsafe { ctx.read_at(SYS_ARG[1])? };
     let Some(mut entry) = EVENTS.reserve::<ExecArgs>(0) else {
         count_drop();
         return Ok(());
@@ -282,19 +329,10 @@ pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
 // Files
 // ---------------------------------------------------------------------------------------------
 
-#[tracepoint]
-pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
-    let _ = try_sys_enter_openat(&ctx);
-    0
-}
-
-fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<(), i32> {
+fn on_open(dfd: i32, filename: *const u8, flags: i32) -> Result<(), i32> {
     if is_self(current_tgid()) {
         return Ok(());
     }
-    let dfd: i64 = unsafe { ctx.read_at(SYS_ARG[0])? };
-    let filename: *const u8 = unsafe { ctx.read_at(SYS_ARG[1])? };
-    let flags: i64 = unsafe { ctx.read_at(SYS_ARG[2])? };
     let Some(ev) = OPEN_SCRATCH.get_ptr_mut(0) else {
         return Ok(());
     };
@@ -302,15 +340,15 @@ fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<(), i32> {
         if bpf_probe_read_user_str_bytes(filename, &mut (*ev).filename).is_err() {
             (*ev).filename[0] = 0;
         }
-        is_noise(&(*ev).filename, flags as i32)
+        is_noise(&(*ev).filename, flags)
     };
     if noise {
         return Ok(());
     }
     unsafe {
         fill_header(&raw mut (*ev).hdr, KIND_OPEN);
-        (*ev).flags = flags as i32;
-        (*ev).dfd = dfd as i32;
+        (*ev).flags = flags;
+        (*ev).dfd = dfd;
     }
     let tid = bpf_get_current_pid_tgid() as u32;
     if PENDING_OPENS.insert(tid, unsafe { &*ev }, 0).is_err() {
@@ -319,49 +357,27 @@ fn try_sys_enter_openat(ctx: &TracePointContext) -> Result<(), i32> {
     Ok(())
 }
 
-#[tracepoint]
-pub fn sys_exit_openat(ctx: TracePointContext) -> u32 {
-    let _ = try_sys_exit_openat(&ctx);
-    0
-}
-
-fn try_sys_exit_openat(ctx: &TracePointContext) -> Result<(), i32> {
+/// Emits the open that `on_open` parked for this thread, if the syscall succeeded.
+fn on_open_exit(ret: i64) {
     let tid = bpf_get_current_pid_tgid() as u32;
     // Most opens were filtered as noise at entry and have nothing pending.
     let Some(pending) = (unsafe { PENDING_OPENS.get(tid) }) else {
-        return Ok(());
+        return;
     };
-    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET) }.unwrap_or(-1);
     if ret >= 0 && EVENTS.output::<Open>(pending, 0).is_err() {
         count_drop();
     }
     let _ = PENDING_OPENS.remove(tid);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
 // Network
 // ---------------------------------------------------------------------------------------------
 
-#[tracepoint]
-pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
-    // connect(fd, uservaddr, addrlen)
-    let _ = try_net(&ctx, NET_OP_CONNECT, SYS_ARG[1]);
-    0
-}
-
-#[tracepoint]
-pub fn sys_enter_sendto(ctx: TracePointContext) -> u32 {
-    // sendto(fd, buff, len, flags, addr, addr_len): only calls that name a destination.
-    let _ = try_net(&ctx, NET_OP_SENDTO, SYS_ARG[4]);
-    0
-}
-
-fn try_net(ctx: &TracePointContext, op: u32, addr_arg: usize) -> Result<(), i32> {
+fn on_net(op: u32, addr: *const u8) -> Result<(), i32> {
     if is_self(current_tgid()) {
         return Ok(());
     }
-    let addr: *const u8 = unsafe { ctx.read_at(addr_arg)? };
     if addr.is_null() {
         return Ok(());
     }

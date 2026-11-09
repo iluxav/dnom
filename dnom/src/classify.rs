@@ -39,6 +39,14 @@ pub struct ClassifyArgs {
     /// Format of the input events.
     #[arg(long, value_enum, default_value_t = Source::Dnom)]
     source: Source,
+    /// The events come from another machine (e.g. `dnom collect` in the lab VM over SSH):
+    /// don't look processes up in this machine's /proc.
+    #[arg(long)]
+    remote_source: bool,
+    /// Home directory shortened to ~ in episodes (default: $HOME; set it to the monitored
+    /// machine's home with --remote-source).
+    #[arg(long)]
+    home: Option<String>,
     /// Backend name from `backends:` in dnom.yaml (default: its `backend:` setting), or `none`
     /// to print the episodes that would be assessed without asking a model.
     #[arg(long)]
@@ -143,7 +151,12 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
 
     unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
 
+    let home = args.home.clone().unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+    let _ = HOME.set(home.trim_end_matches('/').to_string());
     let mut tracker = Tracker::new(config, baseline, 0);
+    if args.remote_source {
+        tracker = tracker.remote();
+    }
     let (exes, dests) = tracker.baseline.len();
     eprintln!(
         "dnom classify: backend={} config={} questions={} policies={} (dry run) ignore_rules={} baseline={} exes/{} destinations{}",
@@ -362,9 +375,11 @@ fn tick(
     Ok(assessed)
 }
 
+/// Home directory shortened to ~ in episodes; set once at startup.
+static HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn tracker_home() -> &'static str {
-    static HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| std::env::var("HOME").unwrap_or_default())
+    HOME.get().map(String::as_str).unwrap_or("")
 }
 
 fn report(

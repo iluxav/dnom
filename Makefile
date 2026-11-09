@@ -23,6 +23,9 @@ KEV_GPU      ?=
 # Lab VM (lab/vm/vm.sh): Ubuntu 26.04 under QEMU/KVM, networked via passt (no host access).
 VM           := lab/vm/vm.sh
 NAME         ?= clean
+# VM episodes get their own baseline and log, separate from the desktop's.
+VM_STATE     := $(HOME)/.local/state/dnom/vm
+VM_LEARN     ?= 30
 # Official Falco container with only the dnom catch-all rules; nothing is installed on the host
 # and /etc/falco is not touched. JSON alerts go to stdout; Falco's own log (warnings and
 # errors only) goes to FALCO_LOG so it doesn't mix with dnom's output.
@@ -55,6 +58,7 @@ FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 .DEFAULT_GOAL := help
 .PHONY: help build test fmt run collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
+        vm-push vm-run vm-fake-exfil \
         replay replay-dry bench log jev-check reset-baseline clean
 
 help: ## List commands
@@ -122,6 +126,17 @@ vm-ssh: ## Lab VM: shell as user lab
 
 vm-check: ## Lab VM: verify provisioning, bpf LSM, tools, internet, and no host access
 	$(VM) check
+
+vm-push: build ## Lab VM: copy dnom and the test scripts into the VM (~/dnom)
+	$(VM) push
+
+vm-run: build ## Lab VM: dnom collect in the VM, classify here (the Jev key never enters the VM)
+	@mkdir -p $(VM_STATE)
+	$(VM) ssh 'sudo ~/dnom/dnom collect' | $(BIN) classify --remote-source --home /home/lab \
+	  --state-dir $(VM_STATE) --learn $(VM_LEARN) $(CLASSIFY_FLAGS)
+
+vm-fake-exfil: ## Lab VM: run the harmless credential-theft simulation inside the VM
+	$(VM) ssh 'cd ~/dnom && ./scripts/fake-exfil.sh'
 
 vm-stop: ## Lab VM: clean shutdown
 	$(VM) stop

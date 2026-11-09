@@ -24,26 +24,23 @@ use tokio::{io::unix::AsyncFd, signal, time};
 use crate::event::{Data, Event};
 
 /// (program name in dnom-ebpf, tracepoint category, tracepoint name)
-const PROGRAMS: [(&str, &str, &str); 8] = [
-    ("sys_enter_execve", "syscalls", "sys_enter_execve"),
+/// Syscalls come through the two raw_syscalls tracepoints (the per-syscall ones lost most
+/// events on Ubuntu's 7.0 kernel); the eBPF side dispatches on the x86_64 syscall number
+/// (execve, execveat, open, creat, openat, openat2, connect, sendto).
+const PROGRAMS: [(&str, &str, &str); 5] = [
+    ("raw_sys_enter", "raw_syscalls", "sys_enter"),
+    ("raw_sys_exit", "raw_syscalls", "sys_exit"),
     ("sched_process_exec", "sched", "sched_process_exec"),
     ("sched_process_fork", "sched", "sched_process_fork"),
     ("sched_process_exit", "sched", "sched_process_exit"),
-    ("sys_enter_openat", "syscalls", "sys_enter_openat"),
-    ("sys_exit_openat", "syscalls", "sys_exit_openat"),
-    ("sys_enter_connect", "syscalls", "sys_enter_connect"),
-    ("sys_enter_sendto", "syscalls", "sys_enter_sendto"),
 ];
 
-/// Syscall argument offsets the eBPF code hard-codes; checked against tracefs at startup.
-const SYSCALL_OFFSETS: [(&str, &str, u32); 7] = [
-    ("sys_enter_execve", "argv", 24),
-    ("sys_enter_openat", "dfd", 16),
-    ("sys_enter_openat", "filename", 24),
-    ("sys_enter_openat", "flags", 32),
-    ("sys_exit_openat", "ret", 16),
-    ("sys_enter_connect", "uservaddr", 24),
-    ("sys_enter_sendto", "addr", 48),
+/// Tracepoint field offsets the eBPF code hard-codes; checked against tracefs at startup.
+const TRACE_OFFSETS: [(&str, &str, &str, u32); 4] = [
+    ("raw_syscalls", "sys_enter", "id", 8),
+    ("raw_syscalls", "sys_enter", "args", 16),
+    ("raw_syscalls", "sys_exit", "id", 8),
+    ("raw_syscalls", "sys_exit", "ret", 16),
 ];
 
 pub async fn run() -> anyhow::Result<()> {
@@ -53,10 +50,13 @@ pub async fn run() -> anyhow::Result<()> {
     bump_memlock();
 
     let tracefs = tracefs_root()?;
-    for (name, field, want) in SYSCALL_OFFSETS {
-        let got = field_offset(tracefs, "syscalls", name, field)?;
+    if !cfg!(target_arch = "x86_64") {
+        bail!("dnom collect dispatches on x86_64 syscall numbers; other architectures are not supported yet");
+    }
+    for (category, name, field, want) in TRACE_OFFSETS {
+        let got = field_offset(tracefs, category, name, field)?;
         if got != want {
-            bail!("syscalls:{name} field {field} is at offset {got}, eBPF code expects {want}");
+            bail!("{category}:{name} field {field} is at offset {got}, eBPF code expects {want}");
         }
     }
 
@@ -99,37 +99,42 @@ pub async fn run() -> anyhow::Result<()> {
 
     let clock = Clock::new();
     let mut out = BufWriter::new(io::stdout().lock());
+    // Processes already running when the sensors attached: without this, a consumer on
+    // another machine (classify --remote-source) would only ever see their pids.
+    let snapshot = snapshot_processes(&mut out)?;
+    eprintln!("dnom collect: snapshot of {snapshot} running processes");
     let mut pending_argv: HashMap<u32, Vec<String>> = HashMap::new();
     let mut emitted: u64 = 0;
     let mut dropped_reported: u64 = 0;
-    let mut stats_tick = time::interval(Duration::from_secs(10));
+    // Safety net: drain once a second even without a wakeup, and report drops every 10 s.
+    let mut drain_tick = time::interval(Duration::from_secs(1));
+    let mut ticks: u64 = 0;
     let ctrl_c = signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
     loop {
         tokio::select! {
             _ = &mut ctrl_c => break,
-            _ = stats_tick.tick() => {
-                let dropped = total_dropped(&stats);
-                if dropped > dropped_reported {
-                    eprintln!("dnom collect: {} events dropped so far (ring buffer full)", dropped);
-                    dropped_reported = dropped;
+            _ = drain_tick.tick() => {
+                if !drain(ring.get_mut(), &mut out, &clock, &mut pending_argv, &mut emitted)? {
+                    return Ok(());
+                }
+                ticks += 1;
+                if ticks % 10 == 0 {
+                    let dropped = total_dropped(&stats);
+                    if dropped > dropped_reported {
+                        eprintln!("dnom collect: {} events dropped so far (ring buffer full)", dropped);
+                        dropped_reported = dropped;
+                    }
                 }
             }
             guard = ring.readable_mut() => {
                 let mut guard = guard?;
-                let rb = guard.get_inner_mut();
-                while let Some(item) = rb.next() {
-                    if let Some(event) = decode(&item, &clock, &mut pending_argv) {
-                        if write_event(&mut out, &event).is_err() {
-                            // Reader went away (e.g. classify exited): stop quietly.
-                            return Ok(());
-                        }
-                        emitted += 1;
-                    }
-                }
+                // Clear readiness BEFORE draining. The kernel only wakes us when we have caught
+                // up; clearing after the drain could erase a wakeup for a record that arrived in
+                // between, and no further wakeup would ever come (the collector would stall).
                 guard.clear_ready();
-                if out.flush().is_err() {
+                if !drain(guard.get_inner_mut(), &mut out, &clock, &mut pending_argv, &mut emitted)? {
                     return Ok(());
                 }
             }
@@ -141,6 +146,74 @@ pub async fn run() -> anyhow::Result<()> {
         total_dropped(&stats)
     );
     Ok(())
+}
+
+/// One fork (parent -> child) plus one exec event per running process, oldest first so a
+/// parent is always described before its children. Kernel threads and dnom itself are skipped.
+fn snapshot_processes(out: &mut impl Write) -> anyhow::Result<usize> {
+    let own = std::process::id();
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mut procs = Vec::new();
+    for entry in fs::read_dir("/proc").context("read /proc")?.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        if pid == own {
+            continue;
+        }
+        let dir = entry.path();
+        // Kernel threads have no executable.
+        let Ok(exe) = fs::read_link(dir.join("exe")) else { continue };
+        let Ok(stat) = fs::read_to_string(dir.join("stat")) else { continue };
+        // comm is in parentheses and may contain spaces; fields after it are space-separated.
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else { continue };
+        let comm = stat[open + 1..close].to_string();
+        let rest: Vec<&str> = stat[close + 2..].split(' ').collect();
+        let ppid: u32 = rest.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let start: u64 = rest.get(19).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let uid = fs::read_to_string(dir.join("status"))
+            .ok()
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:").map(|u| u.split_whitespace().next().unwrap_or("").to_string())))
+            .and_then(|u| u.parse().ok())
+            .unwrap_or(u32::MAX);
+        let argv: Vec<String> = fs::read(dir.join("cmdline"))
+            .unwrap_or_default()
+            .split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .take(ARGV_MAX)
+            .map(|a| String::from_utf8_lossy(&a[..a.len().min(ARG_LEN - 1)]).into_owned())
+            .collect();
+        procs.push((start, pid, ppid, uid, comm, exe.to_string_lossy().into_owned(), argv));
+    }
+    procs.sort_by_key(|p| (p.0, p.1));
+    for (_, pid, ppid, uid, comm, exe, argv) in &procs {
+        let base = |data| Event { ts_ms: now_ms, pid: *pid, tid: *pid, uid: *uid, comm: comm.clone(), cgroup: 0, data };
+        if *ppid > 0 {
+            let fork = Event { pid: *ppid, tid: *ppid, comm: String::new(), ..base(Data::Fork { child: *pid }) };
+            write_event(out, &fork)?;
+        }
+        write_event(out, &base(Data::Exec { exe: exe.clone(), argv: argv.clone() }))?;
+    }
+    out.flush()?;
+    Ok(procs.len())
+}
+
+/// Prints every record in the ring buffer. Returns false when stdout is gone (the reader,
+/// e.g. classify, exited), so the caller can stop quietly.
+fn drain(
+    rb: &mut RingBuf<MapData>,
+    out: &mut impl Write,
+    clock: &Clock,
+    pending_argv: &mut HashMap<u32, Vec<String>>,
+    emitted: &mut u64,
+) -> anyhow::Result<bool> {
+    while let Some(item) = rb.next() {
+        if let Some(event) = decode(&item, clock, pending_argv) {
+            if write_event(out, &event).is_err() {
+                return Ok(false);
+            }
+            *emitted += 1;
+        }
+    }
+    Ok(out.flush().is_ok())
 }
 
 fn write_event(out: &mut impl Write, event: &Event) -> io::Result<()> {

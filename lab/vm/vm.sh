@@ -5,7 +5,7 @@
 # but NOT services on the host's loopback (Ollama, Docker ports, desl...). SSH from the host
 # only, on 127.0.0.1:$SSH_PORT. Disks, keys and logs live in $STATE, outside the repo.
 #
-# Usage: vm.sh fetch|setup|start|wait|ssh [cmd...]|check|stop|snapshot NAME|reset NAME|
+# Usage: vm.sh fetch|setup|start|wait|ssh [cmd...]|check|push|stop|snapshot NAME|reset NAME|
 #              snapshots|status|destroy --yes
 set -euo pipefail
 
@@ -39,6 +39,7 @@ pid_alive() { [[ -f $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
 running() { pid_alive "$STATE/qemu.pid"; }
 require_stopped() { ! running || die "the VM is running; stop it first: make vm-stop"; }
 guest() { ssh "${SSH_OPTS[@]}" lab@127.0.0.1 "$@"; }
+REPO=$(cd "$HERE/../.." && pwd)
 
 cmd_fetch() {
   need curl sha256sum
@@ -152,6 +153,18 @@ cmd_stop() {
   rm -f "$STATE/qemu.pid" "$STATE/passt.pid" "$STATE/passt.sock" "$STATE/monitor.sock"
 }
 
+# Copies the host-built dnom (glibc 2.34+, the guest has 2.43) and the test scripts to ~/dnom.
+cmd_push() {
+  running || die "not running: make vm-start"
+  [[ -x $REPO/target/release/dnom ]] || die "build first: make build"
+  guest 'mkdir -p ~/dnom/scripts'
+  scp -q -i "$KEY" -P "$SSH_PORT" -o UserKnownHostsFile="$STATE/known_hosts" -o LogLevel=ERROR \
+    "$REPO/target/release/dnom" lab@127.0.0.1:dnom/dnom
+  scp -q -i "$KEY" -P "$SSH_PORT" -o UserKnownHostsFile="$STATE/known_hosts" -o LogLevel=ERROR \
+    "$REPO"/scripts/*.sh lab@127.0.0.1:dnom/scripts/
+  guest '~/dnom/dnom --version'
+}
+
 cmd_snapshot() {
   local name=${1:?usage: vm.sh snapshot NAME}
   require_stopped
@@ -190,6 +203,7 @@ case ${1:-} in
   wait) cmd_wait ;;
   ssh) shift; guest "$@" ;;
   check) cmd_check ;;
+  push) cmd_push ;;
   stop) cmd_stop ;;
   snapshot) cmd_snapshot "${2:-}" ;;
   reset) cmd_reset "${2:-}" ;;
