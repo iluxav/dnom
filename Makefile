@@ -1,6 +1,6 @@
 # dnom PoC: common commands. Run `make` to list them.
 #
-# Variables you can override: make run ONLY=fake-exfil, make replay BACKEND=local
+# Variables you can override: make run ONLY=fake-exfil, make falco QUIET=1, make replay BACKEND=local
 # BACKEND is a name from `backends:` in dnom.yaml (or none); MODEL overrides its model.
 BIN          := target/release/dnom
 BACKEND      ?= jev
@@ -31,7 +31,9 @@ export TYPESAFE_API_KEY
 
 # classify refuses to send everything to Jev unless told so explicitly.
 MODEL_FLAG   := $(if $(strip $(MODEL)),--model $(MODEL))
-CLASSIFY_FLAGS := --backend $(BACKEND) $(MODEL_FLAG)
+# QUIET=1: print only episodes a policy rule matched (everything is still logged).
+QUIET        ?=
+CLASSIFY_FLAGS := --backend $(BACKEND) $(MODEL_FLAG) $(if $(strip $(QUIET)),--matches-only)
 ifneq ($(strip $(ONLY)),)
   CLASSIFY_FLAGS += --only $(ONLY)
 else

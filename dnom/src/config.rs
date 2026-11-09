@@ -16,6 +16,9 @@ pub struct Config {
     /// Context and typed questions sent with each episode; missing parts use the built-ins.
     #[serde(default)]
     pub assessment: crate::questions::AssessmentConfig,
+    /// Dry-run rules over model answers and episode facts (SPEC §4.5).
+    #[serde(default)]
+    pub policies: crate::policy::PolicyConfig,
     /// Backend used when `classify` is run without `--backend`.
     #[serde(default = "crate::backends::default_backend")]
     pub backend: String,
@@ -36,6 +39,7 @@ impl Default for Config {
             paths: Default::default(),
             redact: Default::default(),
             assessment: Default::default(),
+            policies: Default::default(),
             backend: crate::backends::default_backend(),
             backends: crate::backends::default_backends(),
             ignore: Vec::new(),
@@ -144,6 +148,10 @@ pub fn load(path: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)> {
             .with_context(|| format!("{}: assessment", candidate.display()))?;
         crate::backends::validate(&config.backend, &config.backends)
             .with_context(|| format!("{}: backends", candidate.display()))?;
+        config
+            .policies
+            .compile(&config.assessment)
+            .with_context(|| format!("{}: policies", candidate.display()))?;
         for rule in &config.ignore {
             if !rule.has_matcher() {
                 bail!(

@@ -64,6 +64,44 @@ redact:
 # Restart classify (or make run) after editing. Empty strings and unknown settings are errors.
 # Redaction remains best effort: embedded shell scripts and unlabelled secrets can escape it.
 
+# Policies (dry run): rules over model answers and episode facts. A match prints
+# "WOULD: <rule> -> <actions>" and is logged; nothing is ever executed in this PoC.
+# when: comparisons (== != > >= < <=) joined with and / or / not, parentheses allowed.
+#   Fields: question ids (noul/score: number; choice: option name, e.g. response == "alert";
+#   <choice>.<option>: that option's probability), flags ("new_exe" in flags),
+#   files.credentials / files.persistence / files.system_binaries / files.temp (counts),
+#   net.new / net.total (destination counts), procs, uid.
+#   Rules that need a model answer don't match when there is none (e.g. --backend none).
+# actions: alert, kill_tree, block_net, quarantine_exe (reported only).
+# protected: programs whose episodes would never get anything but alert.
+# Typos (unknown fields, options that don't exist) stop classify at startup.
+policies:
+  dry_run: true
+  protected: [sshd, sshd-session, systemd, init, dnom, falco]
+  rules:
+    # No model needed, so it holds even if an attacker manipulates what the model reads.
+    - name: credentials-then-new-destination
+      when: files.credentials > 0 and net.new > 0
+      actions: [alert]
+
+    # Each model rule requires low fits_baseline: git push, ssh and sudo score high on
+    # behaviour but are rated normal, and must not match.
+    - name: credential-theft
+      when: credential_access >= 0.85 and exfiltration >= 0.6 and fits_baseline < 0.3
+      actions: [alert, kill_tree, block_net]
+
+    - name: exfiltration
+      when: exfiltration >= 0.8 and fits_baseline < 0.3
+      actions: [alert, block_net]
+
+    - name: persistence
+      when: persistence >= 0.7 and fits_baseline < 0.5
+      actions: [alert]
+
+    - name: model-says-contain
+      when: response == "contain"
+      actions: [alert]
+
 # Model backends. `classify --backend <name>` picks one; without it, `backend:` below.
 # `none` is built in: build episodes and print them without asking a model.
 #   type          jev (Jev's System One API; self-hosted Kev and Von speak it too)

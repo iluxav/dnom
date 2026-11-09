@@ -7,6 +7,7 @@ mod episode;
 mod event;
 mod falco;
 mod paths;
+mod policy;
 mod questions;
 mod redact;
 

@@ -22,6 +22,7 @@ use crate::{
     config,
     episode::{Baseline, Episode, Tracker},
     event::{Data, Event},
+    policy::{Match, Policies},
     questions::Question,
 };
 
@@ -76,6 +77,9 @@ pub struct ClassifyArgs {
     /// Print each assessment as one JSON line instead of the text summary.
     #[arg(long)]
     json: bool,
+    /// Only print episodes a policy rule matched (all assessments are still logged).
+    #[arg(long)]
+    matches_only: bool,
     /// Directory for baseline.json and assessments.jsonl (default ~/.local/state/dnom).
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -112,6 +116,7 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let log_path = state_dir.join("assessments.jsonl");
 
     let assessment = config.assessment.clone();
+    let policies = config.policies.compile(&assessment)?;
     let model = args.model.as_deref();
     let backend: Option<Box<dyn Backend>> = match &selected {
         None => None,
@@ -140,10 +145,11 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let mut tracker = Tracker::new(config, baseline, 0);
     let (exes, dests) = tracker.baseline.len();
     eprintln!(
-        "dnom classify: backend={} config={} questions={} ignore_rules={} baseline={} exes/{} destinations{}",
+        "dnom classify: backend={} config={} questions={} policies={} (dry run) ignore_rules={} baseline={} exes/{} destinations{}",
         backend_label,
         config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "defaults".into()),
         assessment.questions.len(),
+        policies.len(),
         ignore_count,
         exes,
         dests,
@@ -190,7 +196,7 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         }
         let due = *next_tick.get_or_insert(now_ms + interval_ms);
         if now_ms >= due || ended {
-            assessed_total += tick(&mut tracker, &args, backend.as_deref(), &assessment.questions, &mut log, now_ms, ended)?;
+            assessed_total += tick(&mut tracker, &args, backend.as_deref(), &assessment.questions, &policies, &mut log, now_ms, ended)?;
             next_tick = Some(now_ms + interval_ms);
         }
         if !replay && last_status.elapsed() >= Duration::from_secs(15) {
@@ -294,6 +300,7 @@ fn tick(
     args: &ClassifyArgs,
     backend: Option<&dyn Backend>,
     questions: &[Question],
+    policies: &Policies,
     log: &mut File,
     now_ms: u64,
     final_tick: bool,
@@ -339,7 +346,12 @@ fn tick(
         };
         ep.assessed_version = version;
         ep.first_unassessed_ms = None;
-        report(ep, &episode_json, result.as_ref(), questions, args.json, log)?;
+        let matches = policies.evaluate(&episode_json, result.as_ref().map(|(_, a, _)| &a.answers));
+        if !args.matches_only || !matches.is_empty() {
+            report(ep, &episode_json, result.as_ref(), questions, &matches, args.json, log)?;
+        } else {
+            log_record(ep, &episode_json, result.as_ref(), &matches, log)?;
+        }
         assessed += 1;
     }
     if waiting > 0 {
@@ -359,27 +371,11 @@ fn report(
     episode_json: &Value,
     result: Option<&(&str, Assessment, Duration)>,
     questions: &[Question],
+    matches: &[Match],
     as_json: bool,
     log: &mut File,
 ) -> anyhow::Result<()> {
-    let record = match result {
-        Some((backend, a, took)) => json!({
-            "ts": crate::episode::rfc3339(wall_ms()),
-            "episode_id": ep.id,
-            "episode_hash": format!("{:016x}", fnv1a(episode_json.to_string().as_bytes())),
-            "backend": backend,
-            "model": a.model,
-            "latency_ms": took.as_millis() as u64,
-            "input_tokens": a.input_tokens,
-            "answers": a.answers,
-            "notes": a.notes,
-            "episode": episode_json,
-        }),
-        None => json!({ "episode_id": ep.id, "backend": "none", "episode": episode_json }),
-    };
-    if result.is_some() {
-        writeln!(log, "{record}")?;
-    }
+    let record = log_record(ep, episode_json, result, matches, log)?;
 
     let mut out = io::stdout().lock();
     if as_json {
@@ -392,6 +388,55 @@ fn report(
     };
     writeln!(out, "\n{}  {}  {}  uid={}  {header}", clock(ep.last_ms), ep.id, ep.label(), ep.root_uid)?;
     writeln!(out, "  cmd:   {}", episode_json["root"]["argv"].as_str().unwrap_or(""))?;
+    for m in matches {
+        let actions: Vec<&str> = m.actions.iter().map(|a| a.name()).collect();
+        let values: Vec<String> = m.values.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let protected = if m.protected { " (protected program: would skip all but alert)" } else { "" };
+        writeln!(out, "  WOULD: {} → {}{protected}   [{}]", m.rule, actions.join(", "), values.join(" "))?;
+    }
+    report_body(episode_json, result, questions, &mut out)?;
+    Ok(out.flush()?)
+}
+
+/// Appends the assessment (with policy matches) to assessments.jsonl and returns it.
+fn log_record(
+    ep: &Episode,
+    episode_json: &Value,
+    result: Option<&(&str, Assessment, Duration)>,
+    matches: &[Match],
+    log: &mut File,
+) -> anyhow::Result<Value> {
+    let policy: Vec<Value> = matches.iter().map(Match::to_json).collect();
+    let record = match result {
+        Some((backend, a, took)) => json!({
+            "ts": crate::episode::rfc3339(wall_ms()),
+            "episode_id": ep.id,
+            "episode_hash": format!("{:016x}", fnv1a(episode_json.to_string().as_bytes())),
+            "backend": backend,
+            "model": a.model,
+            "latency_ms": took.as_millis() as u64,
+            "input_tokens": a.input_tokens,
+            "answers": a.answers,
+            "notes": a.notes,
+            "policy": policy,
+            "episode": episode_json,
+        }),
+        None => json!({ "episode_id": ep.id, "backend": "none", "policy": policy, "episode": episode_json }),
+    };
+    // Dry runs (no model) are logged only when a rule matched, so the log stays useful.
+    if result.is_some() || !matches.is_empty() {
+        writeln!(log, "{record}")?;
+    }
+    Ok(record)
+}
+
+/// Model answers, files, network and flags of an episode, for the text summary.
+fn report_body(
+    episode_json: &Value,
+    result: Option<&(&str, Assessment, Duration)>,
+    questions: &[Question],
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     if let Some((_, a, _)) = result {
         let mut parts = Vec::new();
         for q in questions {
@@ -438,7 +483,7 @@ fn report(
     if result.is_none() {
         writeln!(out, "  procs: {}", episode_json["tree"].as_array().map_or(0, |t| t.len()))?;
     }
-    Ok(out.flush()?)
+    Ok(())
 }
 
 
