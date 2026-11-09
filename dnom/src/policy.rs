@@ -8,9 +8,10 @@
 //! Fields: every question id (noul/score: number, choice: chosen option as a string,
 //! `<choice>.<option>`: that option's probability), plus episode facts: `flags` (list),
 //! `files.credentials` / `files.persistence` / `files.system_binaries` / `files.temp`
-//! (counts), `net.new` / `net.total` (destination counts), `procs`, `uid`.
-//! A rule that needs a model answer the episode doesn't have (no backend, failed call)
-//! does not match.
+//! (counts), `net.new` / `net.total` (destination counts), `procs`, `uid`, and, when the
+//! source knows them (Falco), `container.name`, `container.image`, `k8s.pod`, `k8s.namespace`.
+//! A rule that needs a value the episode doesn't have (no backend, a failed call, a host
+//! episode for a container field) does not match.
 
 use std::collections::BTreeMap;
 
@@ -22,6 +23,15 @@ use crate::{
     assess::Answer,
     questions::{AssessmentConfig, QuestionType},
 };
+
+/// Episode text facts from the event source (Falco): (field, key under `container` in the
+/// episode JSON). Missing outside a container, so rules using them don't match host episodes.
+const EPISODE_STRINGS: &[(&str, &str)] = &[
+    ("container.name", "name"),
+    ("container.image", "image"),
+    ("k8s.pod", "pod"),
+    ("k8s.namespace", "namespace"),
+];
 
 const EPISODE_NUMBERS: &[&str] = &[
     "files.credentials",
@@ -398,6 +408,10 @@ impl FieldTypes {
         for f in EPISODE_NUMBERS {
             m.insert(f.to_string(), Ty::Num);
         }
+        for (f, _) in EPISODE_STRINGS {
+            // Free text: any string literal is allowed (an empty option list skips the typo check).
+            m.insert(f.to_string(), Ty::Choice(Vec::new()));
+        }
         m.insert("flags".into(), Ty::List);
         Self(m)
     }
@@ -493,6 +507,12 @@ impl Ctx<'_> {
             ),
             "procs" => Val::Num(count(&ep["tree"])),
             "uid" => ep["root"]["uid"].as_f64().map_or(Val::Missing, Val::Num),
+            f if let Some((_, key)) = EPISODE_STRINGS.iter().find(|(name, _)| *name == f) => {
+                match ep["container"][key].as_str() {
+                    Some(s) if !s.is_empty() => Val::Str(s.to_string()),
+                    _ => Val::Missing,
+                }
+            }
             f if f.starts_with("files.") => Val::Num(count(&ep["files"][&f["files.".len()..]])),
             f => {
                 let Some(answers) = self.answers else { return Val::Missing };
@@ -646,6 +666,34 @@ mod tests {
         // sudo reading /etc/shadow from a new program tree (cred 0.79, normal 0.69): no rule.
         let sudo = episode("/usr/bin/make", &["/etc/shadow"], false, &["new_exe"]);
         assert!(p.evaluate(&sudo, Some(&answers(0.79, 0.07, 0.14, 0.06, 0.69, "watch"))).is_empty());
+    }
+
+    #[test]
+    fn container_fields() {
+        let c = PolicyConfig {
+            rules: vec![PolicyRule {
+                name: "prod-shell".into(),
+                when: r#"k8s.namespace == "prod" and container.image != "busybox:1" and files.credentials > 0"#.into(),
+                actions: vec![Action::Alert],
+            }],
+            ..PolicyConfig::default()
+        };
+        let p = c.compile(&AssessmentConfig::default()).unwrap();
+        let mut ep = json!({ "root": { "exe": "/bin/sh", "uid": 0 }, "files": { "credentials": ["/etc/shadow"] },
+                             "network": [], "tree": [], "flags": [] });
+        assert!(p.evaluate(&ep, None).is_empty(), "host episode: container fields are missing, no match");
+        ep["container"] = json!({ "name": "web", "image": "nginx:1.27", "pod": "web-7f9c", "namespace": "prod" });
+        let m = p.evaluate(&ep, None);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].values.iter().find(|(k, _)| k == "k8s.namespace").map(|(_, v)| v.as_str()), Some("prod"));
+        ep["container"]["namespace"] = json!("dev");
+        assert!(p.evaluate(&ep, None).is_empty());
+        // Unknown container field: an error at startup.
+        let bad = PolicyConfig {
+            rules: vec![PolicyRule { name: "x".into(), when: r#"k8s.nspace == "prod""#.into(), actions: vec![Action::Alert] }],
+            ..PolicyConfig::default()
+        };
+        assert!(bad.compile(&AssessmentConfig::default()).unwrap_err().to_string().contains("unknown field"));
     }
 
     #[test]

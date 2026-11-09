@@ -7,7 +7,7 @@
 use anyhow::{Context as _, anyhow};
 use serde_json::Value;
 
-use crate::event::{Data, Event};
+use crate::event::{Container, Data, Event};
 
 /// Events from one line of Falco output. Empty for valid Falco JSON this adapter doesn't
 /// use (alerts from other rules, exits of non-leader threads).
@@ -27,6 +27,7 @@ pub fn parse_line(line: &str) -> anyhow::Result<Vec<Event>> {
         uid: num(f, "user.uid").unwrap_or(u32::MAX as u64) as u32,
         comm: text(f, "proc.name"),
         cgroup: 0,
+        container: container_of(f),
         data: Data::Exit {},
     };
     let event = |data: Data| Event { data, ..base.clone() };
@@ -41,6 +42,8 @@ pub fn parse_line(line: &str) -> anyhow::Result<Vec<Event>> {
                         pid: ppid as u32,
                         tid: ppid as u32,
                         comm: String::new(),
+                        // The parent may be outside the container (runc, containerd-shim).
+                        container: None,
                         data: Data::Fork { child: pid },
                         ..base.clone()
                     };
@@ -59,17 +62,58 @@ pub fn parse_line(line: &str) -> anyhow::Result<Vec<Event>> {
         }
         "dnom_connect" => {
             let ip = text(f, "fd.sip");
-            let port = num(f, "fd.sport").unwrap_or(0);
-            if ip.is_empty() {
-                return Ok(Vec::new());
-            }
-            let dest = if ip.contains(':') { format!("[{ip}]:{port}") } else { format!("{ip}:{port}") };
+            // Successful or in-progress connects fill fd.sip; failed ones only evt.arg.addr.
+            let dest = if !ip.is_empty() {
+                let port = num(f, "fd.sport").unwrap_or(0);
+                Some(if ip.contains(':') { format!("[{ip}]:{port}") } else { format!("{ip}:{port}") })
+            } else {
+                dest_from_addr(&text(f, "evt.arg.addr"))
+            };
+            let Some(dest) = dest else { return Ok(Vec::new()) };
             let op = if text(f, "evt.type") == "connect" { "connect" } else { "sendto" };
             vec![event(Data::Net { op: op.into(), dest })]
         }
         // procexit fires per thread; only the thread-group leader's exit ends the process.
         "dnom_exit" if tid == pid => vec![event(Data::Exit {})],
         _ => Vec::new(),
+    })
+}
+
+/// `ip:port` from Falco's connect `addr` argument (`203.0.113.7:80`, IPv6 `::1:8080` or
+/// `[::1]:8080`), in dnom's form (`[ip]:port` for IPv6). None for anything else (a Unix socket
+/// path, `<NA>`).
+fn dest_from_addr(addr: &str) -> Option<String> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+    })
+}
+
+/// Container and Kubernetes context Falco attaches to each event (its default config appends
+/// these fields to every rule's output). `container.id` is "host" for processes on the host.
+fn container_of(f: &Value) -> Option<Container> {
+    let id = text(f, "container.id");
+    if id.is_empty() || id == "host" {
+        return None;
+    }
+    let some = |s: String| (!s.is_empty()).then_some(s);
+    let repo = text(f, "container.image.repository");
+    let tag = text(f, "container.image.tag");
+    let image = match (repo.is_empty(), tag.is_empty()) {
+        (true, _) => None,
+        (false, true) => Some(repo),
+        (false, false) => Some(format!("{repo}:{tag}")),
+    };
+    Some(Container {
+        id,
+        name: some(text(f, "container.name")),
+        image,
+        pod: some(text(f, "k8s.pod.name")),
+        namespace: some(text(f, "k8s.ns.name")),
     })
 }
 
@@ -121,6 +165,62 @@ mod tests {
             "output_fields": fields,
         })
         .to_string()
+    }
+
+    #[test]
+    fn failed_connect_uses_the_addr_argument() {
+        // Shape from Falco 0.45: busybox wget timing out (ERESTARTSYS), fd.sip empty.
+        let evs = parse_line(&line(
+            "dnom_connect",
+            serde_json::json!({
+                "evt.rawtime": 1u64, "proc.pid": 9, "thread.tid": 9, "user.uid": 0, "proc.name": "wget",
+                "evt.type": "connect", "fd.sip": null, "fd.sport": null, "evt.arg.addr": "203.0.113.7:80",
+            }),
+        ))
+        .unwrap();
+        assert!(matches!(&evs[0].data, Data::Net { op, dest } if op == "connect" && dest == "203.0.113.7:80"));
+        for (addr, want) in [("::1:8080", Some("[::1]:8080")), ("[::1]:8080", Some("[::1]:8080")),
+                             ("/run/x.sock", None), ("<NA>", None), ("", None)] {
+            assert_eq!(dest_from_addr(addr).as_deref(), want, "{addr}");
+        }
+    }
+
+    #[test]
+    fn container_and_pod_context() {
+        let exec = |extra: Value| {
+            let mut f = serde_json::json!({
+                "evt.rawtime": 1u64, "proc.pid": 7, "proc.ppid": 6, "user.uid": 0, "proc.name": "sh",
+                "proc.exepath": "/bin/sh", "proc.args": "",
+            });
+            f.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            parse_line(&line("dnom_exec", f)).unwrap()
+        };
+        // Kubernetes pod (shape from Falco 0.45 output; k8s fields are null outside a pod).
+        let evs = exec(serde_json::json!({
+            "container.id": "3f2a9c1b7e01", "container.name": "web", "container.image.repository": "nginx",
+            "container.image.tag": "1.27", "k8s.pod.name": "web-7f9c", "k8s.ns.name": "prod",
+        }));
+        assert_eq!(evs[0].container, None, "the synthesized fork's parent may be outside the container");
+        assert_eq!(
+            evs[1].container,
+            Some(Container {
+                id: "3f2a9c1b7e01".into(),
+                name: Some("web".into()),
+                image: Some("nginx:1.27".into()),
+                pod: Some("web-7f9c".into()),
+                namespace: Some("prod".into()),
+            })
+        );
+        // Plain Docker: no pod.
+        let evs = exec(serde_json::json!({
+            "container.id": "aa11", "container.name": "db", "container.image.repository": "postgres",
+            "container.image.tag": "", "k8s.pod.name": null, "k8s.ns.name": null,
+        }));
+        let c = evs[1].container.as_ref().unwrap();
+        assert_eq!((c.image.as_deref(), c.pod.as_deref()), (Some("postgres"), None));
+        // Host process.
+        let evs = exec(serde_json::json!({ "container.id": "host", "container.name": "host" }));
+        assert_eq!(evs[1].container, None);
     }
 
     #[test]

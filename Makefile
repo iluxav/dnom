@@ -32,6 +32,7 @@ VM_LEARN     ?= 30
 FALCO_LOG    := $(STATE)/falco.log
 FALCO_RUN    := sudo docker run --rm --name dnom-falco --privileged \
   -v /proc:/host/proc:ro -v /etc:/host/etc:ro -v /sys/kernel/tracing:/sys/kernel/tracing:ro \
+  -v /var/run/docker.sock:/host/var/run/docker.sock \
   -v $(CURDIR)/integrations/falco:/etc/falco/dnom:ro \
   --entrypoint /usr/bin/falco $(FALCO_IMAGE) \
   -r /etc/falco/dnom/dnom-catchall.yaml -o json_output=true -o engine.kind=modern_ebpf \

@@ -200,7 +200,7 @@ fn snapshot_processes(out: &mut impl Write) -> anyhow::Result<(usize, u64)> {
     procs.sort_by_key(|p| (p.0, p.1));
     let mut written = 0u64;
     for (_, pid, ppid, uid, comm, exe, argv) in &procs {
-        let base = |data| Event { ts_ms: now_ms, pid: *pid, tid: *pid, uid: *uid, comm: comm.clone(), cgroup: 0, data };
+        let base = |data| Event { ts_ms: now_ms, pid: *pid, tid: *pid, uid: *uid, comm: comm.clone(), cgroup: 0, container: None, data };
         if *ppid > 0 {
             let fork = Event { pid: *ppid, tid: *ppid, comm: String::new(), ..base(Data::Fork { child: *pid }) };
             write_event(out, &fork)?;
@@ -335,6 +335,7 @@ fn event_of(hdr: &Header, clock: &Clock, data: Data) -> Event {
         uid: hdr.uid,
         comm: cstr(&hdr.comm),
         cgroup: hdr.cgroup_id,
+        container: None,
         data,
     }
 }

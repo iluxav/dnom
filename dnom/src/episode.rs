@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config,
-    event::{Data, Event},
+    event::{Container, Data, Event},
     paths,
 };
 
@@ -35,6 +35,8 @@ pub struct Proc {
     /// Name of the ignore rule covering this process, if any.
     pub ignored: Option<String>,
     pub exited_ms: Option<u64>,
+    /// Container the process runs in (None: the host, or unknown).
+    pub container: Option<Container>,
 }
 
 pub struct TreeEntry {
@@ -54,6 +56,8 @@ pub struct NetEntry {
 pub struct Episode {
     pub id: String,
     pub root: u32,
+    /// Container the episode ran in (None: the host, or unknown).
+    pub container: Option<Container>,
     pub start_ms: u64,
     pub last_ms: u64,
     pub root_exe: String,
@@ -122,7 +126,7 @@ impl Episode {
         if self.tree_truncated > 0 {
             tree.push(json!({ "more_processes_not_shown": self.tree_truncated }));
         }
-        json!({
+        let mut v = json!({
             "episode_id": self.id,
             "window": { "start": rfc3339(self.start_ms), "end": rfc3339(self.last_ms) },
             "root": {
@@ -136,7 +140,19 @@ impl Episode {
             "other_file_opens": self.other_opens,
             "network": self.net.iter().map(|n| json!({ "dest": n.dest, "by": n.by, "new_destination": n.new })).collect::<Vec<_>>(),
             "flags": self.flags,
-        })
+        });
+        // Only when known, so host episodes look exactly as before. The container id is left
+        // out: it means nothing to the model.
+        if let Some(c) = &self.container {
+            let mut m = serde_json::Map::new();
+            for (k, val) in [("name", &c.name), ("image", &c.image), ("pod", &c.pod), ("namespace", &c.namespace)] {
+                if let Some(val) = val {
+                    m.insert(k.into(), json!(val));
+                }
+            }
+            v["container"] = Value::Object(m);
+        }
+        v
     }
 }
 
@@ -227,8 +243,18 @@ impl Tracker {
             _ => {}
         }
 
-        self.ensure_proc(ev.pid, Some((&ev.comm, ev.uid)), 0);
+        self.ensure_proc(ev.pid, Some((&ev.comm, ev.uid, ev.container.as_ref())), 0);
         let learning = ev.ts_ms < self.learn_until_ms;
+        if let Some(c) = &ev.container
+            && let Some(p) = self.procs.get_mut(&ev.pid)
+        {
+            p.container = Some(c.clone());
+            if let Some(ep) = self.episodes.get_mut(&p.root)
+                && ep.container.is_none()
+            {
+                ep.container = Some(c.clone());
+            }
+        }
         let ts = ev.ts_ms;
 
         // The kernel reports the real uid on every event, so it beats anything inferred
@@ -364,7 +390,7 @@ impl Tracker {
 
     /// Makes sure `pid` (and its ancestors) are in the process table.
     /// `seen` carries comm/uid from the event when the pid was never seen before.
-    fn ensure_proc(&mut self, pid: u32, seen: Option<(&str, u32)>, depth: u32) {
+    fn ensure_proc(&mut self, pid: u32, seen: Option<(&str, u32, Option<&Container>)>, depth: u32) {
         if self.procs.contains_key(&pid) {
             return;
         }
@@ -397,7 +423,7 @@ impl Tracker {
             ),
             (None, None) => (String::new(), Vec::new(), String::new(), None),
         };
-        if let Some((c, _)) = seen
+        if let Some((c, _, _)) = seen
             && !c.is_empty()
         {
             comm = c.to_string();
@@ -405,13 +431,20 @@ impl Tracker {
         // A forked child runs as its parent until it changes credentials. Defaulting to 0
         // here used to make plain user shells look like root.
         let uid = seen
-            .map(|(_, u)| u)
+            .map(|(_, u, _)| u)
             .or(proc_info.as_ref().map(|i| i.uid))
             .or(parent.map(|p| p.uid))
             .unwrap_or(0);
 
+        let container = seen.and_then(|(_, _, c)| c.cloned());
+        // Entering a container (runc / containerd-shim on the host starts the container's first
+        // process) starts a new episode: what runs in a container is its own story.
+        let enters_container = container.as_ref().is_some_and(|c| {
+            parent.is_some_and(|p| p.container.as_ref().map(|pc| &pc.id) != Some(&c.id))
+        });
+        let container = container.or_else(|| parent.and_then(|p| p.container.clone()));
         let root = match parent {
-            Some(parent) if !self.starts_episode_below(parent) => parent.root,
+            Some(parent) if !enters_container && !self.starts_episode_below(parent) => parent.root,
             _ => pid,
         };
         let ignored = ignored.or_else(|| {
@@ -424,7 +457,7 @@ impl Tracker {
         });
         self.procs.insert(
             pid,
-            Proc { ppid, exe, argv, comm, uid, root, ignored, exited_ms: None },
+            Proc { ppid, exe, argv, comm, uid, root, ignored, exited_ms: None, container },
         );
     }
 
@@ -464,14 +497,15 @@ impl Tracker {
             return;
         }
         let parent_name = self.parent_name(root);
-        let (exe, argv, uid) = self
+        let (exe, argv, uid, container) = self
             .procs
             .get(&root)
-            .map(|p| (p.exe.clone(), self.config.redact.redact_argv(&p.argv), p.uid))
+            .map(|p| (p.exe.clone(), self.config.redact.redact_argv(&p.argv), p.uid, p.container.clone()))
             .unwrap_or_default();
         let mut ep = Episode {
             id: format!("ep-{root}-{:05x}", ts & 0xfffff),
             root,
+            container,
             start_ms: ts,
             last_ms: ts,
             root_exe: exe.clone(),
@@ -637,7 +671,42 @@ mod tests {
     use crate::event::{Data, Event};
 
     fn ev(ts: u64, pid: u32, uid: u32, comm: &str, data: Data) -> Event {
-        Event { ts_ms: ts, pid, tid: pid, uid, comm: comm.into(), cgroup: 1, data }
+        Event { ts_ms: ts, pid, tid: pid, uid, comm: comm.into(), cgroup: 1, container: None, data }
+    }
+
+    fn in_container(mut e: Event, name: &str, ns: Option<&str>) -> Event {
+        e.container = Some(Container {
+            id: format!("id-{name}"),
+            name: Some(name.into()),
+            image: Some("nginx:1.27".into()),
+            pod: ns.map(|_| format!("{name}-7f9c")),
+            namespace: ns.map(String::from),
+        });
+        e
+    }
+
+    /// containerd-shim (host) starts nginx in a container; nginx starts a shell. The container
+    /// is its own episode, labelled with the container, and everything inside stays in it.
+    #[test]
+    fn container_starts_its_own_labelled_episode() {
+        let mut t = Tracker::new(Config::default(), Baseline::default(), 0).remote();
+        let (shim, nginx, sh, cat) = (4_190_301, 4_190_302, 4_190_303, 4_190_304);
+        t.ingest(ev(0, shim, 0, "containerd-shim", exec("/usr/bin/containerd-shim-runc-v2", &["containerd-shim-runc-v2"])));
+        t.ingest(ev(1, shim, 0, "containerd-shim", Data::Fork { child: nginx }));
+        t.ingest(in_container(ev(2, nginx, 0, "nginx", exec("/usr/sbin/nginx", &["nginx", "-g", "daemon off;"])), "web", Some("prod")));
+        t.ingest(ev(3, nginx, 0, "nginx", Data::Fork { child: sh }));
+        t.ingest(in_container(ev(4, sh, 0, "sh", exec("/bin/sh", &["sh", "-c", "cat /etc/shadow"])), "web", Some("prod")));
+        t.ingest(ev(5, sh, 0, "sh", Data::Fork { child: cat }));
+        t.ingest(in_container(ev(6, cat, 0, "cat", exec("/bin/cat", &["cat", "/etc/shadow"])), "web", Some("prod")));
+        t.ingest(in_container(ev(7, cat, 0, "cat", Data::Open { path: "/etc/shadow".into(), flags: 0, write: false }), "web", Some("prod")));
+
+        assert!(t.episodes.contains_key(&nginx), "entering the container starts an episode");
+        assert!(!t.episodes.contains_key(&sh) && !t.episodes.contains_key(&cat), "inside the container: same episode");
+        let json = t.episodes[&nginx].to_json("/root");
+        assert_eq!(json["container"], json!({ "name": "web", "image": "nginx:1.27", "pod": "web-7f9c", "namespace": "prod" }));
+        assert_eq!(json["files"]["credentials"][0], "/etc/shadow");
+        // Host episodes carry no container block.
+        assert!(t.episodes[&shim].to_json("/root").get("container").is_none());
     }
 
     fn exec(exe: &str, argv: &[&str]) -> Data {

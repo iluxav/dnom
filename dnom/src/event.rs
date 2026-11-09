@@ -12,8 +12,27 @@ pub struct Event {
     pub uid: u32,
     pub comm: String,
     pub cgroup: u64,
+    /// Container the process runs in, when the source knows it (Falco). None for processes on
+    /// the host itself, and for `dnom collect`, which doesn't map cgroups to containers yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
     #[serde(flatten)]
     pub data: Data,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Container {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `repository:tag`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Kubernetes pod and namespace, when the container runs in a pod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

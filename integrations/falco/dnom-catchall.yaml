@@ -8,6 +8,11 @@
 # json_output. Rules are named "dnom_*"; other rules' alerts are ignored by the adapter
 # for now. Priority is DEBUG, so Falco's `priority:` setting must be debug (the default).
 #
+# Container context: Falco's default config appends container.id/name/image and
+# k8s.pod.name/k8s.ns.name to every rule's output, and the adapter reads them from there.
+# Falco needs the container runtime's socket for names and images (e.g. mount
+# /var/run/docker.sock at /host/var/run/docker.sock, as `make falco` does).
+#
 # Volume: every exec and every non-noise file open becomes one alert line. Noise is
 # filtered here, in Falco, with the same prefixes dnom's own collector drops in the kernel.
 
@@ -45,16 +50,19 @@
   tags: [dnom]
 
 - rule: dnom_connect
-  desc: Outbound IPv4/IPv6 connection, or UDP send to a new destination (catch-all for dnom).
+  desc: >
+    Outbound IPv4/IPv6 connection attempt, successful or not, or UDP send to a new destination
+    (catch-all for dnom). A failed attempt is still a signal, e.g. an exfiltration try that
+    timed out. For those Falco leaves fd.sip empty; addr carries the destination.
   condition: >
-    ((evt.type = connect and (evt.rawres >= 0 or evt.res = EINPROGRESS))
+    (evt.type = connect
      or (evt.type in (sendto, sendmsg) and fd.l4proto != tcp and fd.connected = false
          and fd.name_changed = true))
     and (fd.typechar = 4 or fd.typechar = 6)
     and dnom_not_self
   output: >-
     dnom net t=%evt.rawtime pid=%proc.pid tid=%thread.tid uid=%user.uid comm=%proc.name
-    op=%evt.type ip=%fd.sip port=%fd.sport
+    op=%evt.type ip=%fd.sip port=%fd.sport addr=%evt.arg.addr
   priority: DEBUG
   tags: [dnom]
 
