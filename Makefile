@@ -20,6 +20,9 @@ KEV_DIR      ?= $(HOME)/.local/share/dnom-lab/kev
 KEV_MODEL    ?= jaredpalmer/kev-0.8b
 # KEV_GPU: a GPU index or UUID (nvidia-smi -L); empty = let Kev pick.
 KEV_GPU      ?=
+# Lab VM (lab/vm/vm.sh): Ubuntu 26.04 under QEMU/KVM, networked via passt (no host access).
+VM           := lab/vm/vm.sh
+NAME         ?= clean
 # Official Falco container with only the dnom catch-all rules; nothing is installed on the host
 # and /etc/falco is not touched. JSON alerts go to stdout; Falco's own log (warnings and
 # errors only) goes to FALCO_LOG so it doesn't mix with dnom's output.
@@ -51,6 +54,7 @@ FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 
 .DEFAULT_GOAL := help
 .PHONY: help build test fmt run collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
+        vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
         replay replay-dry bench log jev-check reset-baseline clean
 
 help: ## List commands
@@ -103,6 +107,36 @@ falco-stats: ## Live: alerts per dnom rule every 5 s (quick health check)
 falco-events: ## Live: every alert the dnom rules emit, one per line (debugging only, very noisy)
 	@mkdir -p $(STATE); echo "Falco log: $(FALCO_LOG)"
 	$(FALCO_RUN) | jq -rc --unbuffered '"\(.rule)  \(.output_fields | del(."evt.rawtime"))"'
+
+# --- lab VM ------------------------------------------------------------------------------
+# Needs: sudo pacman -S qemu-base libisoburn passt
+
+vm-setup: ## Lab VM: download + verify Ubuntu 26.04, create disk and cloud-init seed (once)
+	$(VM) setup
+
+vm-start: ## Lab VM: boot and wait until ready (first boot provisions, ~3-8 min)
+	$(VM) start
+
+vm-ssh: ## Lab VM: shell as user lab
+	$(VM) ssh
+
+vm-check: ## Lab VM: verify provisioning, bpf LSM, tools, internet, and no host access
+	$(VM) check
+
+vm-stop: ## Lab VM: clean shutdown
+	$(VM) stop
+
+vm-snapshot: ## Lab VM: save a snapshot of the stopped VM (NAME=clean)
+	$(VM) snapshot $(NAME)
+
+vm-reset: ## Lab VM: revert the stopped VM to a snapshot (NAME=clean)
+	$(VM) reset $(NAME)
+
+vm-status: ## Lab VM: running or not, and its snapshots
+	$(VM) status
+
+vm-destroy: ## Lab VM: delete disk, seed and key (keeps the downloaded image)
+	$(VM) destroy --yes
 
 kev-serve: ## Start Kev on 127.0.0.1:8009 for --backend kev (KEV_MODEL=..., KEV_GPU=...)
 	cd $(KEV_DIR) && $(if $(strip $(KEV_GPU)),CUDA_VISIBLE_DEVICES=$(KEV_GPU)) \

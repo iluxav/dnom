@@ -1,0 +1,13 @@
+# passt runs with --no-map-gw, so the guest can't reach the host's resolver on
+# 127.0.0.53 (or anything else on the host's loopback). Use public DNS instead.
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "en*"
+    dhcp4: true
+    dhcp6: false
+    dhcp4-overrides:
+      use-dns: false
+    nameservers:
+      addresses: [1.1.1.1, 9.9.9.9]

@@ -1,0 +1,54 @@
+#cloud-config
+# dnom lab guest. __PUBKEY__ is replaced by vm.sh setup with the lab-only SSH key.
+hostname: dnom-lab
+users:
+  - name: lab
+    gecos: dnom lab
+    shell: /bin/bash
+    groups: [sudo, adm]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __PUBKEY__
+ssh_pwauth: false
+disable_root: true
+
+package_update: true
+package_upgrade: false
+packages:
+  - bpftrace
+  - docker.io
+  - build-essential
+  - clang
+  - llvm
+  - jq
+  - curl
+  - git
+  - linux-tools-common
+
+write_files:
+  - path: /usr/local/sbin/dnom-lab-lsm
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Enable the BPF LSM by keeping the kernel's current LSM list and adding bpf.
+      # (Passing only lsm=bpf would replace the list and disable AppArmor.)
+      set -e
+      cur=$(cat /sys/kernel/security/lsm)
+      case ",$cur," in *,bpf,*) echo "bpf LSM already active"; exit 0 ;; esac
+      printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=%s,bpf"\n' "$cur" \
+        > /etc/default/grub.d/99-dnom-lsm.cfg
+      update-grub
+      touch /run/dnom-lab-reboot
+
+runcmd:
+  - [sh, -c, "apt-get install -y linux-tools-$(uname -r) || echo 'no linux-tools for this kernel'"]
+  - [usermod, -aG, docker, lab]
+  - [/usr/local/sbin/dnom-lab-lsm]
+  - [touch, /var/lib/dnom-lab-provisioned]
+
+# Reboot once if the bpf LSM was just added to the kernel command line.
+power_state:
+  mode: reboot
+  condition: test -f /run/dnom-lab-reboot
+  timeout: 30
