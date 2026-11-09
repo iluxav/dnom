@@ -35,6 +35,27 @@ pub struct Container {
     pub namespace: Option<String>,
 }
 
+impl Container {
+    /// Fills the fields this one lacks from `other`, if both are the same container. Falco
+    /// looks container metadata up asynchronously, so a new container's first events can
+    /// carry only its id, and its name and pod arrive on later events.
+    pub fn fill_from(&mut self, other: &Container) {
+        if self.id != other.id {
+            return;
+        }
+        for (mine, theirs) in [
+            (&mut self.name, &other.name),
+            (&mut self.image, &other.image),
+            (&mut self.pod, &other.pod),
+            (&mut self.namespace, &other.namespace),
+        ] {
+            if mine.is_none() {
+                mine.clone_from(theirs);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Data {

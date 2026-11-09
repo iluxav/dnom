@@ -248,11 +248,15 @@ impl Tracker {
         if let Some(c) = &ev.container
             && let Some(p) = self.procs.get_mut(&ev.pid)
         {
-            p.container = Some(c.clone());
-            if let Some(ep) = self.episodes.get_mut(&p.root)
-                && ep.container.is_none()
-            {
-                ep.container = Some(c.clone());
+            match &mut p.container {
+                Some(pc) if pc.id == c.id => pc.fill_from(c),
+                _ => p.container = Some(c.clone()),
+            }
+            if let Some(ep) = self.episodes.get_mut(&p.root) {
+                match &mut ep.container {
+                    Some(ec) => ec.fill_from(c),
+                    None => ep.container = Some(c.clone()),
+                }
             }
         }
         let ts = ev.ts_ms;
@@ -707,6 +711,23 @@ mod tests {
         assert_eq!(json["files"]["credentials"][0], "/etc/shadow");
         // Host episodes carry no container block.
         assert!(t.episodes[&shim].to_json("/root").get("container").is_none());
+    }
+
+    /// Falco's first events from a new pod can carry only the container id (metadata is looked
+    /// up asynchronously); the name and pod on later events must still label the episode.
+    #[test]
+    fn container_metadata_arriving_late_labels_the_episode() {
+        let mut t = Tracker::new(Config::default(), Baseline::default(), 0).remote();
+        let (shim, sh) = (4_190_401, 4_190_402);
+        t.ingest(ev(0, shim, 0, "containerd-shim", exec("/usr/bin/containerd-shim-runc-v2", &["containerd-shim-runc-v2"])));
+        t.ingest(ev(1, shim, 0, "containerd-shim", Data::Fork { child: sh }));
+        let mut bare = ev(2, sh, 0, "sh", exec("/bin/sh", &["sh", "-c", "cat /etc/shadow"]));
+        bare.container = Some(Container { id: "id-web".into(), name: None, image: None, pod: None, namespace: None });
+        t.ingest(bare);
+        t.ingest(in_container(ev(3, sh, 0, "sh", Data::Open { path: "/etc/shadow".into(), flags: 0, write: false }), "web", Some("prod")));
+
+        let json = t.episodes[&sh].to_json("/root");
+        assert_eq!(json["container"], json!({ "name": "web", "image": "nginx:1.27", "pod": "web-7f9c", "namespace": "prod" }));
     }
 
     fn exec(exe: &str, argv: &[&str]) -> Data {

@@ -59,7 +59,7 @@ FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 .DEFAULT_GOAL := help
 .PHONY: help build test fmt run collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
-        vm-push vm-run vm-fake-exfil vm-e2e \
+        vm-push vm-run vm-fake-exfil vm-e2e vm-k3s \
         replay replay-dry bench log jev-check reset-baseline clean
 
 help: ## List commands
@@ -141,6 +141,9 @@ vm-fake-exfil: ## Lab VM: run the harmless credential-theft simulation inside th
 
 vm-e2e: ## Lab VM: end-to-end tests (unit tests, sensors, episodes, policies; Jev if keyed)
 	lab/vm/e2e/run.sh
+
+vm-k3s: ## Lab VM: Kubernetes test (k3s + Falco DaemonSet; pod/namespace in episodes and policies)
+	lab/vm/k3s/run.sh
 
 vm-stop: ## Lab VM: clean shutdown
 	$(VM) stop

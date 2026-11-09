@@ -71,7 +71,8 @@ redact:
 #   <choice>.<option>: that option's probability), flags ("new_exe" in flags),
 #   files.credentials / files.persistence / files.system_binaries / files.temp (counts),
 #   net.new / net.total (destination counts), procs, uid, and with Falco as the source
-#   container.name, container.image ("repo:tag"), k8s.pod, k8s.namespace
+#   container.name, container.image ("repo:tag", Docker's short form: "alpine:3.20", not
+#   "docker.io/library/alpine:3.20"), k8s.pod, k8s.namespace
 #   (e.g. k8s.namespace == "prod"; these are missing for processes on the host itself).
 #   Rules that need a value the episode lacks don't match (no model answer with
 #   --backend none, or a container field for a host episode).

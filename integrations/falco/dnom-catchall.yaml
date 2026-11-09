@@ -11,7 +11,8 @@
 # Container context: Falco's default config appends container.id/name/image and
 # k8s.pod.name/k8s.ns.name to every rule's output, and the adapter reads them from there.
 # Falco needs the container runtime's socket for names and images (e.g. mount
-# /var/run/docker.sock at /host/var/run/docker.sock, as `make falco` does).
+# /var/run/docker.sock at /host/var/run/docker.sock, as `make falco` does; on Kubernetes,
+# the containerd socket, as the DaemonSet in lab/vm/k3s/falco.yaml does).
 #
 # Volume: every exec and every non-noise file open becomes one alert line. Noise is
 # filtered here, in Falco, with the same prefixes dnom's own collector drops in the kernel.

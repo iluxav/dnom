@@ -101,7 +101,7 @@ fn container_of(f: &Value) -> Option<Container> {
         return None;
     }
     let some = |s: String| (!s.is_empty()).then_some(s);
-    let repo = text(f, "container.image.repository");
+    let repo = familiar_image(&text(f, "container.image.repository")).to_string();
     let tag = text(f, "container.image.tag");
     let image = match (repo.is_empty(), tag.is_empty()) {
         (true, _) => None,
@@ -115,6 +115,15 @@ fn container_of(f: &Value) -> Option<Container> {
         pod: some(text(f, "k8s.pod.name")),
         namespace: some(text(f, "k8s.ns.name")),
     })
+}
+
+/// Docker's short form of an image name: `docker.io/library/alpine` → `alpine`,
+/// `docker.io/rancher/pause` → `rancher/pause`; other registries are kept. Kubernetes runtimes
+/// (containerd, CRI-O) report the full name and Docker the short one, so one policy
+/// (`container.image == "alpine:3.20"`) matches both.
+fn familiar_image(repo: &str) -> &str {
+    let r = repo.strip_prefix("docker.io/").or_else(|| repo.strip_prefix("index.docker.io/")).unwrap_or(repo);
+    r.strip_prefix("library/").unwrap_or(r)
 }
 
 /// Falco prints numeric fields as JSON numbers; accept numeric strings too.
@@ -195,9 +204,10 @@ mod tests {
             f.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             parse_line(&line("dnom_exec", f)).unwrap()
         };
-        // Kubernetes pod (shape from Falco 0.45 output; k8s fields are null outside a pod).
+        // Kubernetes pod (shape from Falco 0.45 output on k3s; k8s fields are null outside a
+        // pod). containerd names the image in full; dnom uses Docker's short form.
         let evs = exec(serde_json::json!({
-            "container.id": "3f2a9c1b7e01", "container.name": "web", "container.image.repository": "nginx",
+            "container.id": "3f2a9c1b7e01", "container.name": "web", "container.image.repository": "docker.io/library/nginx",
             "container.image.tag": "1.27", "k8s.pod.name": "web-7f9c", "k8s.ns.name": "prod",
         }));
         assert_eq!(evs[0].container, None, "the synthesized fork's parent may be outside the container");
@@ -218,6 +228,13 @@ mod tests {
         }));
         let c = evs[1].container.as_ref().unwrap();
         assert_eq!((c.image.as_deref(), c.pod.as_deref()), (Some("postgres"), None));
+        for (full, short) in [
+            ("docker.io/rancher/klipper-helm", "rancher/klipper-helm"),
+            ("ghcr.io/org/app", "ghcr.io/org/app"),
+            ("registry.example.com:5000/library/x", "registry.example.com:5000/library/x"),
+        ] {
+            assert_eq!(familiar_image(full), short);
+        }
         // Host process.
         let evs = exec(serde_json::json!({ "container.id": "host", "container.name": "host" }));
         assert_eq!(evs[1].container, None);

@@ -1,0 +1,4 @@
+    # Added by lab/vm/k3s/run.sh to a copy of dnom.yaml: scoped to one namespace, no model.
+    - name: k8s-test-namespace-credentials
+      when: k8s.namespace == "dnom-test" and files.credentials > 0
+      actions: [alert]

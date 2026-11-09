@@ -1,0 +1,48 @@
+# Harmless test pods for lab/vm/k3s. Nothing leaves the VM: 203.0.113.7 is TEST-NET-3 and
+# never routed, and /etc/shadow is each container's own (Alpine's, no real accounts).
+#
+# web (dnom-test)   reads /etc/shadow, tries 203.0.113.7, exits
+# web (dnom-other)  the same, in another namespace: a rule scoped to dnom-test must not match
+# db  (dnom-test)   stays up; run.sh `kubectl exec`s into it
+apiVersion: v1
+kind: Namespace
+metadata: {name: dnom-test}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: dnom-other}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: web, namespace: dnom-test}
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: web
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: [sh, -c, "cat /etc/shadow >/dev/null; wget -q -T 2 -O /dev/null http://203.0.113.7/ || true"]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: web, namespace: dnom-other}
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: web
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: [sh, -c, "cat /etc/shadow >/dev/null; wget -q -T 2 -O /dev/null http://203.0.113.7/ || true"]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: db, namespace: dnom-test}
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: db
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: [sleep, "600"]

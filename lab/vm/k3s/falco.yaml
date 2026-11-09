@@ -1,0 +1,49 @@
+# Falco as a DaemonSet (one per node), the usual Kubernetes deployment, reduced to what the
+# lab test needs: only the dnom catch-all rules (ConfigMap dnom-rules), JSON alerts to a file
+# on the node. The k3s containerd socket gives Falco's container plugin the pod and namespace
+# of each container (it looks for /host/run/k3s/containerd/containerd.sock by default).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: dnom-falco
+spec:
+  selector:
+    matchLabels: {app: falco}
+  template:
+    metadata:
+      labels: {app: falco}
+    spec:
+      tolerations: [{operator: Exists}]
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: falco
+          image: falcosecurity/falco:0.45.2
+          imagePullPolicy: IfNotPresent
+          securityContext: {privileged: true}
+          command: [/usr/bin/falco]
+          args:
+            - -r
+            - /etc/falco/dnom/dnom-catchall.yaml
+            - -o
+            - engine.kind=modern_ebpf
+            - -o
+            - json_output=true
+            - -o
+            - stdout_output.enabled=false
+            - -o
+            - file_output.enabled=true
+            - -o
+            - file_output.filename=/out/falco.json
+          volumeMounts:
+            - {name: proc, mountPath: /host/proc, readOnly: true}
+            - {name: etc, mountPath: /host/etc, readOnly: true}
+            - {name: containerd, mountPath: /host/run/k3s/containerd/containerd.sock}
+            - {name: rules, mountPath: /etc/falco/dnom, readOnly: true}
+            - {name: out, mountPath: /out}
+      volumes:
+        - {name: proc, hostPath: {path: /proc}}
+        - {name: etc, hostPath: {path: /etc}}
+        - {name: containerd, hostPath: {path: /run/k3s/containerd/containerd.sock, type: Socket}}
+        - {name: rules, configMap: {name: dnom-rules}}
+        - {name: out, hostPath: {path: /tmp/dnom-k3s/out, type: DirectoryOrCreate}}
