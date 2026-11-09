@@ -58,11 +58,11 @@ FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 .DEFAULT_GOAL := help
 .PHONY: help build test fmt run collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
-        vm-push vm-run vm-fake-exfil \
+        vm-push vm-run vm-fake-exfil vm-e2e \
         replay replay-dry bench log jev-check reset-baseline clean
 
 help: ## List commands
-	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(firstword $(MAKEFILE_LIST)) | \
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(firstword $(MAKEFILE_LIST)) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
 # --- build -----------------------------------------------------------------------------
@@ -137,6 +137,9 @@ vm-run: build ## Lab VM: dnom collect in the VM, classify here (the Jev key neve
 
 vm-fake-exfil: ## Lab VM: run the harmless credential-theft simulation inside the VM
 	$(VM) ssh 'cd ~/dnom && ./scripts/fake-exfil.sh'
+
+vm-e2e: ## Lab VM: end-to-end tests (unit tests, sensors, episodes, policies; Jev if keyed)
+	lab/vm/e2e/run.sh
 
 vm-stop: ## Lab VM: clean shutdown
 	$(VM) stop

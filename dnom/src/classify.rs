@@ -334,10 +334,13 @@ fn tick(
         .map(|ep| (ep.sensitive_count(), ep.first_unassessed_ms.unwrap_or(0), ep.root))
         .collect();
     ready.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let waiting = ready.len().saturating_sub(args.budget);
+    // The budget bounds model calls per tick. When the input has ended there is no next tick,
+    // so everything still waiting is assessed now instead of being silently dropped.
+    let budget = if final_tick { usize::MAX } else { args.budget };
+    let waiting = ready.len().saturating_sub(budget);
     let mut assessed = 0;
 
-    for &(_, _, root) in ready.iter().take(args.budget) {
+    for &(_, _, root) in ready.iter().take(budget) {
         let Some(ep) = tracker.episodes.get_mut(&root) else { continue };
         let version = ep.version;
         let episode_json = ep.to_json(tracker_home());

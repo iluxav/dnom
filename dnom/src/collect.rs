@@ -101,8 +101,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut out = BufWriter::new(io::stdout().lock());
     // Processes already running when the sensors attached: without this, a consumer on
     // another machine (classify --remote-source) would only ever see their pids.
-    let snapshot = snapshot_processes(&mut out)?;
-    eprintln!("dnom collect: snapshot of {snapshot} running processes");
+    let (snapshot_procs, snapshot_events) = snapshot_processes(&mut out)?;
+    eprintln!("dnom collect: snapshot of {snapshot_procs} running processes");
     let mut pending_argv: HashMap<u32, Vec<String>> = HashMap::new();
     let mut emitted: u64 = 0;
     let mut dropped_reported: u64 = 0;
@@ -142,7 +142,8 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     eprintln!(
-        "dnom collect: stopped. {emitted} events emitted, {} dropped",
+        "dnom collect: stopped. {} events emitted ({snapshot_events} from the startup snapshot), {} dropped",
+        emitted + snapshot_events,
         total_dropped(&stats)
     );
     Ok(())
@@ -150,7 +151,8 @@ pub async fn run() -> anyhow::Result<()> {
 
 /// One fork (parent -> child) plus one exec event per running process, oldest first so a
 /// parent is always described before its children. Kernel threads and dnom itself are skipped.
-fn snapshot_processes(out: &mut impl Write) -> anyhow::Result<usize> {
+/// Returns (processes, events written).
+fn snapshot_processes(out: &mut impl Write) -> anyhow::Result<(usize, u64)> {
     let own = std::process::id();
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     let mut procs = Vec::new();
@@ -184,16 +186,19 @@ fn snapshot_processes(out: &mut impl Write) -> anyhow::Result<usize> {
         procs.push((start, pid, ppid, uid, comm, exe.to_string_lossy().into_owned(), argv));
     }
     procs.sort_by_key(|p| (p.0, p.1));
+    let mut written = 0u64;
     for (_, pid, ppid, uid, comm, exe, argv) in &procs {
         let base = |data| Event { ts_ms: now_ms, pid: *pid, tid: *pid, uid: *uid, comm: comm.clone(), cgroup: 0, data };
         if *ppid > 0 {
             let fork = Event { pid: *ppid, tid: *ppid, comm: String::new(), ..base(Data::Fork { child: *pid }) };
             write_event(out, &fork)?;
+            written += 1;
         }
         write_event(out, &base(Data::Exec { exe: exe.clone(), argv: argv.clone() }))?;
+        written += 1;
     }
     out.flush()?;
-    Ok(procs.len())
+    Ok((procs.len(), written))
 }
 
 /// Prints every record in the ring buffer. Returns false when stdout is gone (the reader,
