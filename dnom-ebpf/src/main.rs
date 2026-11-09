@@ -7,9 +7,9 @@ use aya_ebpf::{
     EbpfContext,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_buf,
+        bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user, bpf_probe_read_user_buf,
         bpf_probe_read_user_str_bytes,
-        generated::{bpf_get_current_cgroup_id, bpf_ktime_get_ns},
+        generated::{bpf_get_current_cgroup_id, bpf_get_current_task_btf, bpf_ktime_get_ns, bpf_task_pt_regs},
     },
     macros::{map, tracepoint},
     maps::{Array, LruHashMap, PerCpuArray, RingBuf},
@@ -57,6 +57,8 @@ const NR_EXECVEAT: i64 = 322;
 const NR_OPENAT2: i64 = 437;
 
 const AT_FDCWD: i32 = -100;
+/// Offset of `sp` in x86_64 `struct pt_regs` (r15..di, orig_ax, ip, cs, flags, sp).
+const PT_REGS_SP: usize = 152;
 const O_WRONLY: i32 = 0o1;
 
 const O_ACCMODE: i32 = 0o3;
@@ -198,9 +200,13 @@ pub fn raw_sys_enter(ctx: TracePointContext) -> u32 {
 #[tracepoint]
 pub fn raw_sys_exit(ctx: TracePointContext) -> u32 {
     let Ok(id) = (unsafe { ctx.read_at::<i64>(RAW_ID) }) else { return 0 };
-    if matches!(id, NR_OPEN | NR_CREAT | NR_OPENAT | NR_OPENAT2) {
-        let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET) }.unwrap_or(-1);
-        on_open_exit(ret);
+    let ret: i64 = unsafe { ctx.read_at(SYS_EXIT_RET) }.unwrap_or(-1);
+    match id {
+        NR_OPEN | NR_CREAT | NR_OPENAT | NR_OPENAT2 => on_open_exit(ret),
+        NR_EXECVE | NR_EXECVEAT if ret == 0 => {
+            let _ = on_exec_done();
+        }
+        _ => {}
     }
     0
 }
@@ -213,13 +219,34 @@ fn on_execve(argv: *const *const u8) -> Result<(), i32> {
     if is_self(current_tgid()) {
         return Ok(());
     }
+    // Read from the caller's memory. Strings on pages that aren't loaded yet (e.g. a binary's
+    // read-only literals) can't be read here and come out empty; on_exec_done fills them in.
+    emit_argv(argv, KIND_EXEC_ARGS)
+}
+
+/// After a successful execve the new program's arguments sit at the top of its fresh stack
+/// (argc, then the argv pointers), written by the kernel just before, so unlike the caller's
+/// memory they are always readable.
+fn on_exec_done() -> Result<(), i32> {
+    if is_self(current_tgid()) {
+        return Ok(());
+    }
+    let regs = unsafe { bpf_task_pt_regs(bpf_get_current_task_btf()) } as *const u8;
+    if regs.is_null() {
+        return Ok(());
+    }
+    let sp: u64 = unsafe { bpf_probe_read_kernel(regs.add(PT_REGS_SP) as *const u64)? };
+    emit_argv((sp + 8) as *const *const u8, KIND_EXEC_ARGS_DONE)
+}
+
+fn emit_argv(argv: *const *const u8, kind: u32) -> Result<(), i32> {
     let Some(mut entry) = EVENTS.reserve::<ExecArgs>(0) else {
         count_drop();
         return Ok(());
     };
     let ev = entry.as_mut_ptr();
     unsafe {
-        fill_header(&raw mut (*ev).hdr, KIND_EXEC_ARGS);
+        fill_header(&raw mut (*ev).hdr, kind);
         (*ev).argc = 0;
         (*ev)._pad = 0;
         let mut i = 0;

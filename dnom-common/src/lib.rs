@@ -15,6 +15,8 @@ pub const KIND_FORK: u32 = 3;
 pub const KIND_EXIT: u32 = 4;
 pub const KIND_OPEN: u32 = 5;
 pub const KIND_NET: u32 = 6;
+/// Arguments read at the exit of a successful execve, from the new program's stack.
+pub const KIND_EXEC_ARGS_DONE: u32 = 7;
 
 pub const NET_OP_CONNECT: u32 = 1;
 pub const NET_OP_SENDTO: u32 = 2;

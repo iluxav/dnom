@@ -4,8 +4,10 @@
 # 1. Copies the release binary, the unit-test binary, the workloads, dnom.yaml and the
 #    replay fixtures into the VM ($VMDIR).
 # 2. Runs the unit tests inside the VM.
-# 3. Runs `dnom collect` in the VM for $ROUNDS rounds; each round runs the benign workload
-#    and the harmless fake-exfil simulation, then stops the collector with SIGINT.
+# 3. Runs `dnom collect` in the VM for $ROUNDS rounds. Each round runs the benign workload,
+#    the syscall-coverage workload (local files and loopback only), the harmless fake-exfil
+#    simulation, then a marker command after 8 s without workload, and stops the collector
+#    with SIGINT.
 # 4. Classifies round 1 on the host: without a model, and with Jev if a key is available
 #    (only the two test episodes are sent; the key never enters the VM).
 # 5. Replays the synthetic fixtures inside the VM.
@@ -50,7 +52,7 @@ say "results: $R"
 stage=$(mktemp -d)
 cp "$BIN" "$stage/dnom"
 cp "$UNIT" "$stage/unit-tests"
-cp lab/vm/e2e/benign.sh scripts/fake-exfil.sh dnom.yaml lab/replay/fake-exfil.jsonl lab/replay/fake-lateral.jsonl "$stage/"
+cp lab/vm/e2e/benign.sh lab/vm/e2e/syscalls.py scripts/fake-exfil.sh dnom.yaml lab/replay/fake-exfil.jsonl lab/replay/fake-lateral.jsonl "$stage/"
 say "copying to the VM ($VMDIR)"
 tar -C "$stage" -cf - . | vm "rm -rf $VMDIR && mkdir -p $VMDIR && tar -C $VMDIR -xf -"
 rm -rf "$stage"
@@ -69,8 +71,13 @@ for n in $(seq 1 "$ROUNDS"); do
   collector=$!
   for _ in $(seq 50); do grep -q 'snapshot of' "$d/collector.log" 2>/dev/null && break; sleep 0.2; done
   vm "exec bash $VMDIR/benign.sh" </dev/null > "$d/benign.log" 2>&1
+  vm "exec python3 -I $VMDIR/syscalls.py $VMDIR" </dev/null > "$d/syscalls.log" 2>&1
   vm "exec bash $VMDIR/fake-exfil.sh" </dev/null > "$d/fake-exfil.log" 2>&1
   vm "cat $VMDIR/benign-result.json" </dev/null > "$d/benign-result.json"
+  vm "cat $VMDIR/syscalls-result.json" </dev/null > "$d/syscalls-result.json"
+  # The collector must still deliver after a quiet period (regression: a lost ring buffer
+  # wakeup once stalled it for good).
+  vm "sleep 8; exec /usr/bin/true dnom-after-idle" </dev/null
   sleep 2   # the collector drains at least once a second
   stop_collector
   wait "$collector" || true

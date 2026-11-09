@@ -48,6 +48,8 @@ for n in range(1, rounds + 1):
     check(f"round {n}: 200 distinct commands captured with arguments",
           {e["argv"][-1] for e in burst} == {f"dnom-burst-{i}" for i in range(1, 201)} and len(burst) == 200,
           {"captured": len(burst)})
+    check(f"round {n}: events still delivered after 8 s without workload",
+          any(e["kind"] == "exec" and "dnom-after-idle" in e["argv"] for e in events))
     stopped = re.search(r"stopped\. (\d+) events emitted \((\d+) from the startup snapshot\), (\d+) dropped", log)
     check(f"round {n}: clean shutdown, 0 dropped, every emitted event reached the output",
           stopped is not None and stopped.group(3) == "0" and int(stopped.group(1)) == len(events),
@@ -82,6 +84,31 @@ check("decoy persistence write captured",
 check("connection attempt to the test address captured",
       any(e["kind"] == "net" and e["dest"] == "203.0.113.7:443" and e["comm"] == "curl" for e in events),
       "TEST-NET-3, not routed; attempt only")
+
+live_execs = [e for e in events if e["kind"] == "exec" and e.get("cgroup") != 0]
+incomplete = [e for e in live_execs if not e["argv"] or "" in e["argv"]]
+check("every command arrives with complete arguments",
+      live_execs and not incomplete,
+      {"execs": len(live_execs), "incomplete": [[e["exe"], e["argv"]] for e in incomplete[:5]]})
+chkpwd = [e["argv"] for e in live_execs if e["exe"].endswith("/unix_chkpwd")]
+if chkpwd:
+    check("unix_chkpwd (literals not yet paged in at execve entry) has its arguments",
+          all(len(a) >= 3 and all(a) for a in chkpwd), chkpwd[:2])
+else:
+    skip("unix_chkpwd (literals not yet paged in at execve entry) has its arguments", "no SSH login seen")
+
+# --- round 1: syscall coverage ------------------------------------------------------------------
+sc = json.loads((d1 / "syscalls-result.json").read_text())
+for name in ("open", "creat", "openat2"):
+    check(f"{name}() captured as a write", any(e["path"] == sc["files"][name] and e["write"] for e in opens), sc["files"][name])
+check("execveat() captured with its arguments",
+      any(e["kind"] == "exec" and "dnom-execveat" in e["argv"] for e in events))
+udp = f"127.0.0.1:{sc['udp_port']}"
+check("UDP sendto() with a destination captured",
+      any(e["kind"] == "net" and e["op"] == "sendto" and e["dest"] == udp and e["pid"] == sc["pid"] for e in events), udp)
+v6 = f"[::1]:{sc['v6_port']}"
+check("IPv6 connect() captured",
+      any(e["kind"] == "net" and e["op"] == "connect" and e["dest"] == v6 and e["pid"] == sc["pid"] for e in events), v6)
 
 # --- round 1: episodes and policies (no model) --------------------------------------------------
 episodes = read_jsonl(results / "episodes-none.jsonl")

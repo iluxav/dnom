@@ -9,7 +9,7 @@ use std::{
     io::{self, BufWriter, Write},
     net::{Ipv4Addr, Ipv6Addr},
     path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, anyhow, bail};
@@ -103,7 +103,7 @@ pub async fn run() -> anyhow::Result<()> {
     // another machine (classify --remote-source) would only ever see their pids.
     let (snapshot_procs, snapshot_events) = snapshot_processes(&mut out)?;
     eprintln!("dnom collect: snapshot of {snapshot_procs} running processes");
-    let mut pending_argv: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut dec = Decoder::default();
     let mut emitted: u64 = 0;
     let mut dropped_reported: u64 = 0;
     // Safety net: drain once a second even without a wakeup, and report drops every 10 s.
@@ -116,7 +116,7 @@ pub async fn run() -> anyhow::Result<()> {
         tokio::select! {
             _ = &mut ctrl_c => break,
             _ = drain_tick.tick() => {
-                if !drain(ring.get_mut(), &mut out, &clock, &mut pending_argv, &mut emitted)? {
+                if !drain(ring.get_mut(), &mut out, &clock, &mut dec, &mut emitted)? {
                     return Ok(());
                 }
                 ticks += 1;
@@ -134,11 +134,23 @@ pub async fn run() -> anyhow::Result<()> {
                 // up; clearing after the drain could erase a wakeup for a record that arrived in
                 // between, and no further wakeup would ever come (the collector would stall).
                 guard.clear_ready();
-                if !drain(guard.get_inner_mut(), &mut out, &clock, &mut pending_argv, &mut emitted)? {
+                if !drain(guard.get_inner_mut(), &mut out, &clock, &mut dec, &mut emitted)? {
                     return Ok(());
                 }
             }
         }
+    }
+
+    // Records still in the ring buffer, then execs still waiting for their exit record.
+    if drain(ring.get_mut(), &mut out, &clock, &mut dec, &mut emitted)? {
+        let mut rest = Vec::new();
+        dec.release_all(&mut rest);
+        for event in &rest {
+            if write_event(&mut out, event).is_ok() {
+                emitted += 1;
+            }
+        }
+        let _ = out.flush();
     }
 
     eprintln!(
@@ -207,16 +219,19 @@ fn drain(
     rb: &mut RingBuf<MapData>,
     out: &mut impl Write,
     clock: &Clock,
-    pending_argv: &mut HashMap<u32, Vec<String>>,
+    dec: &mut Decoder,
     emitted: &mut u64,
 ) -> anyhow::Result<bool> {
+    let mut events = Vec::new();
     while let Some(item) = rb.next() {
-        if let Some(event) = decode(&item, clock, pending_argv) {
-            if write_event(out, &event).is_err() {
-                return Ok(false);
-            }
-            *emitted += 1;
+        dec.feed(&item, clock, &mut events);
+    }
+    dec.release_stale(&mut events);
+    for event in &events {
+        if write_event(out, event).is_err() {
+            return Ok(false);
         }
+        *emitted += 1;
     }
     Ok(out.flush().is_ok())
 }
@@ -233,28 +248,100 @@ fn total_dropped(stats: &PerCpuArray<MapData, u64>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Turns one ring buffer record into an event. `ExecArgs` records are held until the
-/// matching `Exec` arrives, so failed exec attempts (PATH search) never show up.
-fn decode(bytes: &[u8], clock: &Clock, pending_argv: &mut HashMap<u32, Vec<String>>) -> Option<Event> {
-    let hdr: Header = read_record(bytes)?;
-    let data = match hdr.kind {
-        KIND_EXEC_ARGS => {
-            let rec: ExecArgs = read_record(bytes)?;
-            let argc = (rec.argc as usize).min(ARGV_MAX);
-            let argv = rec.argv[..argc].iter().map(|a| cstr(a)).collect();
-            if pending_argv.len() > 8192 {
-                pending_argv.clear();
+/// An exec waits this long for its exit record before it is printed with the arguments read
+/// at syscall entry (only if that record was lost; normally it arrives within microseconds).
+const HOLD_MAX: Duration = Duration::from_secs(1);
+
+/// Turns ring buffer records into events, joining the three records of one exec:
+///
+/// 1. `KIND_EXEC_ARGS` at syscall entry, read from the caller's memory. Strings on pages that
+///    weren't loaded yet come out empty. Failed exec attempts (PATH search) produce only this
+///    record and never show up.
+/// 2. `KIND_EXEC`, the exec itself: held, not printed yet.
+/// 3. `KIND_EXEC_ARGS_DONE` at syscall exit, read from the new program's stack, which the
+///    kernel has just written: always readable. It is the next record from that process, so
+///    holding the exec until it arrives doesn't reorder that process's events.
+#[derive(Default)]
+struct Decoder {
+    /// Arguments at syscall entry, by the calling thread's id.
+    entry_argv: HashMap<u32, Vec<String>>,
+    /// Execs waiting for their exit record, by process id.
+    held: HashMap<u32, (Event, Instant)>,
+}
+
+impl Decoder {
+    fn feed(&mut self, bytes: &[u8], clock: &Clock, out: &mut Vec<Event>) {
+        let Some(hdr) = read_record::<Header>(bytes) else { return };
+        match hdr.kind {
+            KIND_EXEC_ARGS => {
+                let Some(rec) = read_record::<ExecArgs>(bytes) else { return };
+                if self.entry_argv.len() > 8192 {
+                    self.entry_argv.clear();
+                }
+                self.entry_argv.insert(hdr.tid, argv_of(&rec));
             }
-            pending_argv.insert(hdr.tid, argv);
-            return None;
-        }
-        KIND_EXEC => {
-            let rec: Exec = read_record(bytes)?;
-            Data::Exec {
-                exe: cstr(&rec.filename),
-                argv: pending_argv.remove(&rec.old_pid).unwrap_or_default(),
+            KIND_EXEC => {
+                let Some(rec) = read_record::<Exec>(bytes) else { return };
+                let argv = self.entry_argv.remove(&rec.old_pid).unwrap_or_default();
+                let event = event_of(&hdr, clock, Data::Exec { exe: cstr(&rec.filename), argv });
+                if let Some((previous, _)) = self.held.insert(hdr.tgid, (event, Instant::now())) {
+                    out.push(previous);
+                }
+            }
+            KIND_EXEC_ARGS_DONE => {
+                let Some(rec) = read_record::<ExecArgs>(bytes) else { return };
+                let Some((mut event, _)) = self.held.remove(&hdr.tgid) else { return };
+                let done = argv_of(&rec);
+                if let Data::Exec { argv, .. } = &mut event.data
+                    && !done.is_empty()
+                {
+                    *argv = done;
+                }
+                out.push(event);
+            }
+            _ => {
+                if let Some(data) = decode_data(&hdr, bytes) {
+                    out.push(event_of(&hdr, clock, data));
+                }
             }
         }
+    }
+
+    fn release_stale(&mut self, out: &mut Vec<Event>) {
+        let stale: Vec<u32> =
+            self.held.iter().filter(|(_, (_, at))| at.elapsed() >= HOLD_MAX).map(|(pid, _)| *pid).collect();
+        for pid in stale {
+            if let Some((event, _)) = self.held.remove(&pid) {
+                out.push(event);
+            }
+        }
+    }
+
+    fn release_all(&mut self, out: &mut Vec<Event>) {
+        out.extend(self.held.drain().map(|(_, (event, _))| event));
+    }
+}
+
+fn argv_of(rec: &ExecArgs) -> Vec<String> {
+    let argc = (rec.argc as usize).min(ARGV_MAX);
+    rec.argv[..argc].iter().map(|a| cstr(a)).collect()
+}
+
+fn event_of(hdr: &Header, clock: &Clock, data: Data) -> Event {
+    Event {
+        ts_ms: clock.to_unix_ms(hdr.ts_ns),
+        pid: hdr.tgid,
+        tid: hdr.tid,
+        uid: hdr.uid,
+        comm: cstr(&hdr.comm),
+        cgroup: hdr.cgroup_id,
+        data,
+    }
+}
+
+/// Fork, exit, open and network records.
+fn decode_data(hdr: &Header, bytes: &[u8]) -> Option<Data> {
+    Some(match hdr.kind {
         KIND_FORK => {
             let rec: Fork = read_record(bytes)?;
             Data::Fork { child: rec.child_pid }
@@ -286,15 +373,6 @@ fn decode(bytes: &[u8], clock: &Clock, pending_argv: &mut HashMap<u32, Vec<Strin
             Data::Net { op: op.into(), dest }
         }
         _ => return None,
-    };
-    Some(Event {
-        ts_ms: clock.to_unix_ms(hdr.ts_ns),
-        pid: hdr.tgid,
-        tid: hdr.tid,
-        uid: hdr.uid,
-        comm: cstr(&hdr.comm),
-        cgroup: hdr.cgroup_id,
-        data,
     })
 }
 
@@ -422,6 +500,67 @@ mod tests {
     use std::{fs::File, os::fd::AsRawFd};
 
     use super::*;
+
+    fn record_bytes<T>(rec: &T) -> Vec<u8> {
+        // SAFETY: the records are plain #[repr(C)] data.
+        unsafe { std::slice::from_raw_parts((rec as *const T).cast::<u8>(), size_of::<T>()).to_vec() }
+    }
+
+    fn header(kind: u32, tgid: u32, tid: u32) -> Header {
+        Header { kind, tgid, tid, uid: 1000, ts_ns: 0, cgroup_id: 1, comm: [0; COMM_LEN] }
+    }
+
+    fn args(kind: u32, tgid: u32, tid: u32, argv: &[&str]) -> Vec<u8> {
+        let mut rec = ExecArgs { hdr: header(kind, tgid, tid), argc: argv.len() as u32, _pad: 0, argv: [[0; ARG_LEN]; ARGV_MAX] };
+        for (slot, a) in rec.argv.iter_mut().zip(argv) {
+            slot[..a.len()].copy_from_slice(a.as_bytes());
+        }
+        record_bytes(&rec)
+    }
+
+    fn exec(tgid: u32, old_pid: u32, exe: &str) -> Vec<u8> {
+        let mut rec = Exec { hdr: header(KIND_EXEC, tgid, tgid), old_pid, _pad: 0, filename: [0; PATH_LEN] };
+        rec.filename[..exe.len()].copy_from_slice(exe.as_bytes());
+        record_bytes(&rec)
+    }
+
+    fn argv_of_event(e: &Event) -> Vec<String> {
+        match &e.data {
+            Data::Exec { argv, .. } => argv.clone(),
+            _ => panic!("not an exec"),
+        }
+    }
+
+    /// unix_chkpwd case: entry arguments partly empty (literals not paged in yet); the exit
+    /// record from the new stack fills them in.
+    #[test]
+    fn exec_waits_for_exit_arguments() {
+        let clock = Clock::new();
+        let mut dec = Decoder::default();
+        let mut out = Vec::new();
+        dec.feed(&args(KIND_EXEC_ARGS, 7, 7, &["", "lab", ""]), &clock, &mut out);
+        dec.feed(&exec(7, 7, "/usr/sbin/unix_chkpwd"), &clock, &mut out);
+        assert!(out.is_empty(), "the exec is held until its exit record");
+        dec.feed(&args(KIND_EXEC_ARGS_DONE, 7, 7, &["/usr/sbin/unix_chkpwd", "lab", "chkexpiry"]), &clock, &mut out);
+        assert_eq!(argv_of_event(&out[0]), ["/usr/sbin/unix_chkpwd", "lab", "chkexpiry"]);
+
+        // Exit record lost: the exec is still printed, with the entry arguments.
+        out.clear();
+        dec.feed(&args(KIND_EXEC_ARGS, 8, 8, &["ls", "-l"]), &clock, &mut out);
+        dec.feed(&exec(8, 8, "/usr/bin/ls"), &clock, &mut out);
+        dec.release_all(&mut out);
+        assert_eq!(argv_of_event(&out[0]), ["ls", "-l"]);
+
+        // Failed exec attempt (PATH search): entry record only, nothing printed.
+        out.clear();
+        dec.feed(&args(KIND_EXEC_ARGS, 9, 9, &["nope"]), &clock, &mut out);
+        dec.release_all(&mut out);
+        assert!(out.is_empty());
+
+        // An exit record without a held exec (exec before the collector started) is ignored.
+        dec.feed(&args(KIND_EXEC_ARGS_DONE, 10, 10, &["x"]), &clock, &mut out);
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn normalize_joins_and_cleans() {
