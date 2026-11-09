@@ -17,26 +17,34 @@ use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
 
 use crate::{
-    assess::{Answer, Assessment, Backend, Jev, Local, QUESTIONS},
+    assess::{Answer, Assessment, Backend, Jev, Local},
+    backends::{self, BackendType},
     config,
     episode::{Baseline, Episode, Tracker},
     event::{Data, Event},
+    questions::Question,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum BackendKind {
-    /// Ollama on this machine. Nothing leaves the host.
-    Local,
-    /// TypeSafe's Jev API. Episode data leaves the host; needs --only.
-    Jev,
-    /// No model: print the episodes that would be assessed.
-    None,
+pub enum Source {
+    /// JSON lines from `dnom collect`.
+    Dnom,
+    /// Falco JSON output with the dnom catch-all rules (integrations/falco/dnom-catchall.yaml).
+    Falco,
 }
 
 #[derive(Args)]
 pub struct ClassifyArgs {
-    #[arg(long, value_enum, default_value_t = BackendKind::Local)]
-    backend: BackendKind,
+    /// Format of the input events.
+    #[arg(long, value_enum, default_value_t = Source::Dnom)]
+    source: Source,
+    /// Backend name from `backends:` in dnom.yaml (default: its `backend:` setting), or `none`
+    /// to print the episodes that would be assessed without asking a model.
+    #[arg(long)]
+    backend: Option<String>,
+    /// Use this model instead of the backend's `model` from dnom.yaml.
+    #[arg(long)]
+    model: Option<String>,
     /// Read events from this JSONL file (a recording) instead of stdin.
     #[arg(long)]
     input: Option<PathBuf>,
@@ -46,9 +54,9 @@ pub struct ClassifyArgs {
     /// Only assess episodes whose root command line contains this text.
     #[arg(long)]
     only: Option<String>,
-    /// Let --backend jev receive every episode, not just --only matches.
-    #[arg(long)]
-    allow_all_to_jev: bool,
+    /// Let a backend on another machine (e.g. Jev) receive every episode, not just --only matches.
+    #[arg(long, alias = "allow-all-to-jev")]
+    allow_all_remote: bool,
     /// Also assess episodes whose only signal is a new network destination.
     #[arg(long)]
     assess_new_destinations: bool,
@@ -65,14 +73,6 @@ pub struct ClassifyArgs {
     /// Episode closes after this many idle seconds.
     #[arg(long, default_value_t = 60)]
     idle: u64,
-    #[arg(long, default_value = "http://127.0.0.1:11434")]
-    ollama_url: String,
-    #[arg(long, default_value = "qwen3.6:27b-q8_0")]
-    model: String,
-    #[arg(long, default_value = "https://api.typesafe.ai")]
-    jev_url: String,
-    #[arg(long, default_value = "jev-latest")]
-    jev_model: String,
     /// Print each assessment as one JSON line instead of the text summary.
     #[arg(long)]
     json: bool,
@@ -90,13 +90,19 @@ extern "C" fn on_sigint(_: libc::c_int) {
 }
 
 pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
-    if args.backend == BackendKind::Jev && args.only.is_none() && !args.allow_all_to_jev {
+    let (config, config_path) = config::load(args.config.as_deref())?;
+    let selected = backends::select(&config.backends, &config.backend, args.backend.as_deref())?;
+    if let Some((name, def)) = &selected
+        && def.is_remote()
+        && args.only.is_none()
+        && !args.allow_all_remote
+    {
         bail!(
-            "--backend jev sends episode data off this machine. Pass --only <text> to limit it to \
-             a test (e.g. --only fake-exfil), or --allow-all-to-jev to send everything."
+            "backend {name} sends episode data off this machine (to {}). Pass --only <text> to \
+             limit it to a test (e.g. --only fake-exfil), or --allow-all-remote to send everything.",
+            def.host()
         );
     }
-    let (config, config_path) = config::load(args.config.as_deref())?;
     let state_dir = match &args.state_dir {
         Some(d) => d.clone(),
         None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".local/state/dnom"),
@@ -105,15 +111,28 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let baseline_path = state_dir.join("baseline.json");
     let log_path = state_dir.join("assessments.jsonl");
 
-    let backend: Option<Box<dyn Backend>> = match args.backend {
-        BackendKind::Local => Some(Box::new(Local::new(&args.ollama_url, &args.model))),
-        BackendKind::Jev => Some(Box::new(Jev::new(&args.jev_url, &args.jev_model)?)),
-        BackendKind::None => None,
+    let assessment = config.assessment.clone();
+    let model = args.model.as_deref();
+    let backend: Option<Box<dyn Backend>> = match &selected {
+        None => None,
+        Some((name, def)) => Some(match def.kind {
+            BackendType::Jev => Box::new(Jev::new(name, def, model, assessment.clone())?),
+            BackendType::Ollama => Box::new(Local::new(name, def, model, assessment.clone())?),
+        }),
     };
+    let backend_label = match &selected {
+        None => "none (dry run)".to_string(),
+        Some((name, def)) => format!("{name} ({} at {})", model.unwrap_or(&def.model), def.host()),
+    };
+    // (name, host) of a backend on another machine; drives the startup notice below.
+    let remote_target = selected
+        .as_ref()
+        .filter(|(_, def)| def.is_remote())
+        .map(|(name, def)| (name.clone(), def.host().to_string()));
 
     let (baseline, had_baseline) = Baseline::load(&baseline_path);
     let replay = args.input.is_some();
-    let rx = spawn_reader(args.input.clone())?;
+    let rx = spawn_reader(args.input.clone(), args.source)?;
     let ignore_count = config.ignore.len();
 
     unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
@@ -121,9 +140,10 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let mut tracker = Tracker::new(config, baseline, 0);
     let (exes, dests) = tracker.baseline.len();
     eprintln!(
-        "dnom classify: backend={} config={} ignore_rules={} baseline={} exes/{} destinations{}",
-        backend_label(&args),
+        "dnom classify: backend={} config={} questions={} ignore_rules={} baseline={} exes/{} destinations{}",
+        backend_label,
         config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "defaults".into()),
+        assessment.questions.len(),
         ignore_count,
         exes,
         dests,
@@ -132,10 +152,10 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
 
     if let Some(only) = &args.only {
         eprintln!("dnom classify: only assessing episodes whose command contains '{only}'");
-    } else if args.backend == BackendKind::Jev {
+    } else if let Some((name, host)) = &remote_target {
         eprintln!(
-            "dnom classify: sending every assessed episode to Jev (commands, file paths, \
-             destinations; home shortened to ~, secrets in command lines redacted)"
+            "dnom classify: sending every assessed episode to {name} at {host} (commands, file \
+             paths, destinations; home shortened to ~, secrets in command lines redacted)"
         );
     }
 
@@ -170,7 +190,7 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         }
         let due = *next_tick.get_or_insert(now_ms + interval_ms);
         if now_ms >= due || ended {
-            assessed_total += tick(&mut tracker, &args, backend.as_deref(), &mut log, now_ms, ended)?;
+            assessed_total += tick(&mut tracker, &args, backend.as_deref(), &assessment.questions, &mut log, now_ms, ended)?;
             next_tick = Some(now_ms + interval_ms);
         }
         if !replay && last_status.elapsed() >= Duration::from_secs(15) {
@@ -234,16 +254,8 @@ fn status(tracker: &Tracker, counts: &EventCounts, assessed: u64, now_ms: u64) {
     eprintln!("{line}");
 }
 
-fn backend_label(args: &ClassifyArgs) -> String {
-    match args.backend {
-        BackendKind::Local => format!("local ({})", args.model),
-        BackendKind::Jev => format!("jev ({})", args.jev_model),
-        BackendKind::None => "none (dry run)".into(),
-    }
-}
-
 /// Reads JSON lines on a thread so model calls never block event intake.
-fn spawn_reader(input: Option<PathBuf>) -> anyhow::Result<mpsc::Receiver<Event>> {
+fn spawn_reader(input: Option<PathBuf>, source: Source) -> anyhow::Result<mpsc::Receiver<Event>> {
     let reader: Box<dyn BufRead + Send> = match input {
         Some(path) => Box::new(BufReader::new(
             File::open(&path).with_context(|| format!("open {}", path.display()))?,
@@ -255,9 +267,13 @@ fn spawn_reader(input: Option<PathBuf>) -> anyhow::Result<mpsc::Receiver<Event>>
         let mut bad = 0u64;
         for line in reader.lines() {
             let Ok(line) = line else { break };
-            match serde_json::from_str::<Event>(&line) {
-                Ok(event) => {
-                    if tx.send(event).is_err() {
+            let parsed = match source {
+                Source::Dnom => serde_json::from_str::<Event>(&line).map(|e| vec![e]).map_err(anyhow::Error::from),
+                Source::Falco => crate::falco::parse_line(&line),
+            };
+            match parsed {
+                Ok(events) => {
+                    if events.into_iter().any(|e| tx.send(e).is_err()) {
                         break;
                     }
                 }
@@ -277,6 +293,7 @@ fn tick(
     tracker: &mut Tracker,
     args: &ClassifyArgs,
     backend: Option<&dyn Backend>,
+    questions: &[Question],
     log: &mut File,
     now_ms: u64,
     final_tick: bool,
@@ -322,7 +339,7 @@ fn tick(
         };
         ep.assessed_version = version;
         ep.first_unassessed_ms = None;
-        report(ep, &episode_json, result.as_ref(), args.json, log)?;
+        report(ep, &episode_json, result.as_ref(), questions, args.json, log)?;
         assessed += 1;
     }
     if waiting > 0 {
@@ -340,7 +357,8 @@ fn tracker_home() -> &'static str {
 fn report(
     ep: &Episode,
     episode_json: &Value,
-    result: Option<&(&'static str, Assessment, Duration)>,
+    result: Option<&(&str, Assessment, Duration)>,
+    questions: &[Question],
     as_json: bool,
     log: &mut File,
 ) -> anyhow::Result<()> {
@@ -376,14 +394,18 @@ fn report(
     writeln!(out, "  cmd:   {}", episode_json["root"]["argv"].as_str().unwrap_or(""))?;
     if let Some((_, a, _)) = result {
         let mut parts = Vec::new();
-        for q in &QUESTIONS {
-            match a.answers.get(q.id) {
+        for q in questions {
+            match a.answers.get(&q.id) {
                 Some(Answer::Noul { noul }) => {
-                    let mark = if *noul >= 0.7 && q.id != "fits_baseline" { "!" } else { " " };
-                    parts.push(format!("{}{} {:.2}", mark, short(q.id), noul));
+                    let mark = if q.highlighted(*noul) { "!" } else { " " };
+                    parts.push(format!("{mark}{} {noul:.2}", q.label()));
                 }
                 Some(Answer::Choice { choice, confidence, .. }) => {
-                    parts.push(format!(" → {choice} ({confidence:.2})"));
+                    parts.push(format!(" {}={choice} ({confidence:.2})", q.label()));
+                }
+                Some(Answer::Score { score, .. }) => {
+                    let top = q.levels.len().saturating_sub(1);
+                    parts.push(format!(" {}={score:.1}/{top}", q.label()));
                 }
                 None => {}
             }
@@ -419,16 +441,6 @@ fn report(
     Ok(out.flush()?)
 }
 
-fn short(id: &str) -> &str {
-    match id {
-        "credential_access" => "cred",
-        "persistence" => "persist",
-        "exfiltration" => "exfil",
-        "lateral_movement" => "lateral",
-        "fits_baseline" => "normal",
-        other => other,
-    }
-}
 
 fn category_label(category: &str) -> &str {
     match category {

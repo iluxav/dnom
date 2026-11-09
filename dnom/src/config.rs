@@ -1,4 +1,5 @@
-//! `dnom.yaml`: ignore rules and episode boundaries. Policies (SPEC §4.5) will live here later.
+//! `dnom.yaml`: ignore rules, episode boundaries, path and redaction rules, and the
+//! assessment questions. Policies (SPEC §4.5) will live here later.
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,15 @@ pub struct Config {
     pub paths: crate::paths::PathRules,
     #[serde(default)]
     pub redact: crate::redact::RedactRules,
+    /// Context and typed questions sent with each episode; missing parts use the built-ins.
+    #[serde(default)]
+    pub assessment: crate::questions::AssessmentConfig,
+    /// Backend used when `classify` is run without `--backend`.
+    #[serde(default = "crate::backends::default_backend")]
+    pub backend: String,
+    /// Named model backends (url, model, api_key_env); leave out to use the built-ins.
+    #[serde(default = "crate::backends::default_backends")]
+    pub backends: std::collections::BTreeMap<String, crate::backends::BackendDef>,
     /// Process trees that are not sent to the model.
     #[serde(default)]
     pub ignore: Vec<IgnoreRule>,
@@ -25,6 +35,9 @@ impl Default for Config {
         Self {
             paths: Default::default(),
             redact: Default::default(),
+            assessment: Default::default(),
+            backend: crate::backends::default_backend(),
+            backends: crate::backends::default_backends(),
             ignore: Vec::new(),
             boundaries: default_boundaries(),
         }
@@ -125,6 +138,12 @@ pub fn load(path: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)> {
             .redact
             .validate()
             .with_context(|| format!("{}: redaction rules", candidate.display()))?;
+        config
+            .assessment
+            .validate()
+            .with_context(|| format!("{}: assessment", candidate.display()))?;
+        crate::backends::validate(&config.backend, &config.backends)
+            .with_context(|| format!("{}: backends", candidate.display()))?;
         for rule in &config.ignore {
             if !rule.has_matcher() {
                 bail!(
@@ -242,5 +261,7 @@ redact:
         let c: Config = serde_saphyr::from_str(include_str!("../../dnom.yaml")).unwrap();
         c.paths.validate().unwrap();
         c.redact.validate().unwrap();
+        c.assessment.validate().unwrap();
+        crate::backends::validate(&c.backend, &c.backends).unwrap();
     }
 }

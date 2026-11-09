@@ -1,10 +1,13 @@
 mod assess;
+mod backends;
 mod classify;
 mod collect;
 mod config;
 mod episode;
 mod event;
+mod falco;
 mod paths;
+mod questions;
 mod redact;
 
 use clap::{Parser, Subcommand};

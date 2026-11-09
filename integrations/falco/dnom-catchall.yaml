@@ -1,0 +1,66 @@
+# dnom catch-all rules for Falco (tested shape: Falco 0.45).
+#
+# These rules don't detect anything. They make Falco emit the raw activity dnom builds
+# episodes from: program starts, file opens, outbound connections and process exits.
+# dnom reads Falco's JSON output with `dnom classify --source falco`.
+#
+# Install: add this file to Falco's rules (e.g. /etc/falco/rules.d/) and enable
+# json_output. Rules are named "dnom_*"; other rules' alerts are ignored by the adapter
+# for now. Priority is DEBUG, so Falco's `priority:` setting must be debug (the default).
+#
+# Volume: every exec and every non-noise file open becomes one alert line. Noise is
+# filtered here, in Falco, with the same prefixes dnom's own collector drops in the kernel.
+
+- list: dnom_noise_always
+  items: [/proc, /sys]
+
+# Dropped only for read-only opens: libraries, fonts, shared data.
+- list: dnom_noise_read
+  items: [/usr/lib, /usr/lib64, /lib, /lib64, /usr/share, /usr/local/lib, /etc/ld.so.cache,
+          /etc/fonts, /var/cache/fontconfig, /usr/libexec]
+
+- macro: dnom_not_self
+  condition: (not proc.name in (falco, dnom))
+
+- rule: dnom_exec
+  desc: Successful program start (catch-all for dnom).
+  condition: evt.type in (execve, execveat) and evt.rawres = 0 and dnom_not_self
+  output: >-
+    dnom exec t=%evt.rawtime pid=%proc.pid tid=%thread.tid ppid=%proc.ppid uid=%user.uid
+    comm=%proc.name exe=%proc.exepath args=%proc.args
+  priority: DEBUG
+  tags: [dnom]
+
+- rule: dnom_open
+  desc: Successful open of a regular file outside noise paths (catch-all for dnom).
+  condition: >
+    evt.type in (open, openat, openat2) and fd.typechar = 'f' and fd.num >= 0
+    and not fd.name pmatch (dnom_noise_always)
+    and not (evt.is_open_write = false and fd.name pmatch (dnom_noise_read))
+    and dnom_not_self
+  output: >-
+    dnom open t=%evt.rawtime pid=%proc.pid tid=%thread.tid uid=%user.uid comm=%proc.name
+    file=%fd.name write=%evt.is_open_write flags=%evt.arg.flags
+  priority: DEBUG
+  tags: [dnom]
+
+- rule: dnom_connect
+  desc: Outbound IPv4/IPv6 connection, or UDP send to a new destination (catch-all for dnom).
+  condition: >
+    ((evt.type = connect and (evt.rawres >= 0 or evt.res = EINPROGRESS))
+     or (evt.type in (sendto, sendmsg) and fd.l4proto != tcp and fd.connected = false
+         and fd.name_changed = true))
+    and (fd.typechar = 4 or fd.typechar = 6)
+    and dnom_not_self
+  output: >-
+    dnom net t=%evt.rawtime pid=%proc.pid tid=%thread.tid uid=%user.uid comm=%proc.name
+    op=%evt.type ip=%fd.sip port=%fd.sport
+  priority: DEBUG
+  tags: [dnom]
+
+- rule: dnom_exit
+  desc: Process exit (catch-all for dnom; the adapter keeps only thread-group leaders).
+  condition: evt.type = procexit and dnom_not_self
+  output: dnom exit t=%evt.rawtime pid=%proc.pid tid=%thread.tid uid=%user.uid comm=%proc.name
+  priority: DEBUG
+  tags: [dnom]
