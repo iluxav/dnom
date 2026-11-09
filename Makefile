@@ -14,6 +14,12 @@ STATE        := $(HOME)/.local/state/dnom
 REPLAY_STATE := /tmp/dnom-replay
 RECORDINGS   := lab/recordings
 FALCO_IMAGE  ?= falcosecurity/falco:0.45.2
+# Kev (self-hosted decision model) for --backend kev. Install once:
+#   git clone https://github.com/jaredpalmer/kev $(KEV_DIR) && cd $(KEV_DIR) && uv sync --extra serve
+KEV_DIR      ?= $(HOME)/.local/share/dnom-lab/kev
+KEV_MODEL    ?= jaredpalmer/kev-0.8b
+# KEV_GPU: a GPU index or UUID (nvidia-smi -L); empty = let Kev pick.
+KEV_GPU      ?=
 # Official Falco container with only the dnom catch-all rules; nothing is installed on the host
 # and /etc/falco is not touched. JSON alerts go to stdout; Falco's own log (warnings and
 # errors only) goes to FALCO_LOG so it doesn't mix with dnom's output.
@@ -44,7 +50,7 @@ endif
 FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 
 .DEFAULT_GOAL := help
-.PHONY: help build test fmt run collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop \
+.PHONY: help build test fmt run collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         replay replay-dry bench log jev-check reset-baseline clean
 
 help: ## List commands
@@ -97,6 +103,10 @@ falco-stats: ## Live: alerts per dnom rule every 5 s (quick health check)
 falco-events: ## Live: every alert the dnom rules emit, one per line (debugging only, very noisy)
 	@mkdir -p $(STATE); echo "Falco log: $(FALCO_LOG)"
 	$(FALCO_RUN) | jq -rc --unbuffered '"\(.rule)  \(.output_fields | del(."evt.rawtime"))"'
+
+kev-serve: ## Start Kev on 127.0.0.1:8009 for --backend kev (KEV_MODEL=..., KEV_GPU=...)
+	cd $(KEV_DIR) && $(if $(strip $(KEV_GPU)),CUDA_VISIBLE_DEVICES=$(KEV_GPU)) \
+	  uv run --extra serve python -m kev.serve --run $(KEV_MODEL) --port 8009 --device cuda
 
 fake-exfil: ## Run the harmless credential-theft simulation (in a 2nd terminal)
 	./scripts/fake-exfil.sh

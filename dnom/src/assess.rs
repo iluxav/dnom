@@ -1,5 +1,6 @@
 //! Assessor (SPEC §4.4, §6, §7): asks the configured questions (`assessment:` in dnom.yaml)
-//! about an episode. `jev` calls TypeSafe's System One API; `local` emulates it with Ollama.
+//! about an episode, through one of three API shapes: System One (Jev and compatible
+//! models), OpenAI Decisions, or a local Ollama model emulating typed answers.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -24,7 +25,7 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
     },
     /// `score` is the probability-weighted level (0 = first level); probabilities are keyed
-    /// by level index ("0", "1", ...), as Jev returns them.
+    /// by level index ("0", "1", ...), as System One returns them.
     Score {
         score: f64,
         confidence: f64,
@@ -32,6 +33,7 @@ pub enum Answer {
     },
 }
 
+#[derive(Debug)]
 pub struct Assessment {
     /// Model name that actually answered.
     pub model: String,
@@ -70,10 +72,10 @@ fn post_json(agent: &ureq::Agent, url: &str, auth: Option<&str>, body: &Value) -
 }
 
 // ---------------------------------------------------------------------------------------------
-// Jev (TypeSafe System One API)
+// System One API: Jev, Kev, Laya, Liquid d1, Cloudflare Clef
 // ---------------------------------------------------------------------------------------------
 
-pub struct Jev {
+pub struct SystemOne {
     name: String,
     agent: ureq::Agent,
     url: String,
@@ -84,9 +86,8 @@ pub struct Jev {
     questions_json: Value,
 }
 
-impl Jev {
-    /// Any System One server (Jev, or Kev / Von running locally). `model` overrides the
-    /// backend's configured model.
+impl SystemOne {
+    /// `model` overrides the backend's configured model.
     pub fn new(
         name: &str,
         def: &BackendDef,
@@ -96,7 +97,7 @@ impl Jev {
         Ok(Self {
             name: name.to_string(),
             agent: agent(Duration::from_secs(def.timeout_secs())),
-            url: format!("{}/v1/systemone", def.url.trim_end_matches('/')),
+            url: def.endpoint().with_context(|| format!("backend {name}"))?,
             key: def.api_key().with_context(|| format!("backend {name}"))?,
             model: model.unwrap_or(&def.model).to_string(),
             questions_json: Value::Object(
@@ -107,11 +108,29 @@ impl Jev {
     }
 }
 
-/// Reads one Jev answer, checking its type matches the question.
-fn parse_jev_answer(q: &Question, a: &Value) -> anyhow::Result<Answer> {
-    let num = |field: &str| {
-        a[field].as_f64().ok_or_else(|| anyhow!("jev: answer '{}' has no {field}", q.id))
+/// Answers from a System One response. Cloudflare's REST API wraps the body in
+/// `{"result": ..., "success": true}`; that wrapper is removed first.
+fn parse_systemone(questions: &[Question], resp: &Value, fallback_model: &str) -> anyhow::Result<Assessment> {
+    let body = if resp.get("answers").is_none() && resp["result"].get("answers").is_some() {
+        &resp["result"]
+    } else {
+        resp
     };
+    let mut answers = BTreeMap::new();
+    for q in questions {
+        answers.insert(q.id.clone(), parse_systemone_answer(q, &body["answers"][&q.id])?);
+    }
+    Ok(Assessment {
+        model: body["model"].as_str().unwrap_or(fallback_model).to_string(),
+        answers,
+        notes: Vec::new(),
+        input_tokens: body["usage"]["input_tokens"].as_u64(),
+    })
+}
+
+/// Reads one System One answer, checking its type matches the question.
+fn parse_systemone_answer(q: &Question, a: &Value) -> anyhow::Result<Answer> {
+    let num = |field: &str| a[field].as_f64().ok_or_else(|| anyhow!("answer '{}' has no {field}", q.id));
     let probabilities =
         || -> BTreeMap<String, f64> { serde_json::from_value(a["probabilities"].clone()).unwrap_or_default() };
     Ok(match q.kind {
@@ -119,7 +138,7 @@ fn parse_jev_answer(q: &Question, a: &Value) -> anyhow::Result<Answer> {
         QuestionType::Choice => Answer::Choice {
             choice: a["choice"]
                 .as_str()
-                .ok_or_else(|| anyhow!("jev: answer '{}' has no choice", q.id))?
+                .ok_or_else(|| anyhow!("answer '{}' has no choice", q.id))?
                 .to_string(),
             confidence: a["confidence"].as_f64().unwrap_or(0.0),
             probabilities: probabilities(),
@@ -132,7 +151,7 @@ fn parse_jev_answer(q: &Question, a: &Value) -> anyhow::Result<Answer> {
     })
 }
 
-impl Backend for Jev {
+impl Backend for SystemOne {
     fn name(&self) -> &str {
         &self.name
     }
@@ -144,16 +163,151 @@ impl Backend for Jev {
             "questions": self.questions_json,
         });
         let resp = post_json(&self.agent, &self.url, self.key.as_deref(), &body)?;
-        let mut answers = BTreeMap::new();
-        for q in &self.assessment.questions {
-            answers.insert(q.id.clone(), parse_jev_answer(q, &resp["answers"][&q.id])?);
+        parse_systemone(&self.assessment.questions, &resp, &self.model)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// OpenAI Decisions API (developers.openai.com/api/docs/guides/decisions)
+// ---------------------------------------------------------------------------------------------
+
+pub struct OpenAi {
+    name: String,
+    agent: ureq::Agent,
+    url: String,
+    key: Option<String>,
+    model: String,
+    assessment: AssessmentConfig,
+}
+
+impl OpenAi {
+    pub fn new(
+        name: &str,
+        def: &BackendDef,
+        model: Option<&str>,
+        assessment: AssessmentConfig,
+    ) -> anyhow::Result<Self> {
+        for q in &assessment.questions {
+            ensure!(
+                q.kind != QuestionType::Score || q.levels.len() >= 2,
+                "backend {name}: OpenAI score questions need at least 2 levels ('{}' has {})",
+                q.id,
+                q.levels.len()
+            );
         }
-        Ok(Assessment {
-            model: resp["model"].as_str().unwrap_or(&self.model).to_string(),
-            answers,
-            notes: Vec::new(),
-            input_tokens: resp["usage"]["input_tokens"].as_u64(),
+        Ok(Self {
+            name: name.to_string(),
+            agent: agent(Duration::from_secs(def.timeout_secs())),
+            url: def.endpoint().with_context(|| format!("backend {name}"))?,
+            key: def.api_key().with_context(|| format!("backend {name}"))?,
+            model: model.unwrap_or(&def.model).to_string(),
+            assessment,
         })
+    }
+}
+
+/// Request body: the context as a developer message, the episode as JSON data, and the
+/// questions translated (noul -> predicate, with its yes/no meanings in the instructions).
+fn openai_request(model: &str, assessment: &AssessmentConfig, episode: &Value) -> Value {
+    let questions: Vec<Value> = assessment
+        .questions
+        .iter()
+        .map(|q| match q.kind {
+            QuestionType::Noul => json!({
+                "type": "predicate",
+                "name": q.id,
+                "instructions": format!(
+                    "{}\nTrue means: {}\nFalse means: {}",
+                    q.instructions,
+                    q.yes_means.as_deref().unwrap_or(""),
+                    q.no_means.as_deref().unwrap_or(""),
+                ),
+            }),
+            QuestionType::Choice => json!({
+                "type": "choice",
+                "name": q.id,
+                "instructions": q.instructions,
+                "choices": q.options.iter().map(|o| json!({
+                    "value": o.name,
+                    "description": o.means.as_deref().unwrap_or(&o.name),
+                })).collect::<Vec<_>>(),
+            }),
+            QuestionType::Score => json!({
+                "type": "score",
+                "name": q.id,
+                "instructions": q.instructions,
+                "levels": q.levels.iter().map(|l| json!({ "label": l, "description": l })).collect::<Vec<_>>(),
+            }),
+        })
+        .collect();
+    json!({
+        "model": model,
+        "input": [
+            { "role": "developer", "content": [{ "type": "input_text", "text": assessment.context }] },
+            { "role": "user", "content": [{ "type": "input_json", "data": episode }] },
+        ],
+        "questions": questions,
+    })
+}
+
+/// Answers from an OpenAI Decisions response (an `answers` list matched by `name`).
+/// A refused question gets no answer and a note; policies treat it as unknown.
+fn parse_openai(questions: &[Question], resp: &Value, fallback_model: &str) -> anyhow::Result<Assessment> {
+    let list = resp["answers"].as_array().ok_or_else(|| anyhow!("openai: response has no answers list"))?;
+    let by_name: BTreeMap<&str, &Value> =
+        list.iter().filter_map(|a| Some((a["name"].as_str()?, a))).collect();
+    let mut answers = BTreeMap::new();
+    let mut notes = Vec::new();
+    for q in questions {
+        let a = by_name.get(q.id.as_str()).ok_or_else(|| anyhow!("openai: no answer for '{}'", q.id))?;
+        if a["type"] == "refusal" {
+            notes.push(format!("{}: refused", q.id));
+            continue;
+        }
+        let num = |v: &Value, field: &str| v[field].as_f64().ok_or_else(|| anyhow!("openai: '{}' has no {field}", q.id));
+        let answer = match q.kind {
+            QuestionType::Noul => Answer::Noul { noul: num(a, "probability")? },
+            QuestionType::Choice => Answer::Choice {
+                choice: a["choice"].as_str().ok_or_else(|| anyhow!("openai: '{}' has no choice", q.id))?.to_string(),
+                confidence: a["confidence"].as_f64().unwrap_or(0.0),
+                probabilities: a["probabilities"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| Some((p["value"].as_str()?.to_string(), p["probability"].as_f64()?)))
+                    .collect(),
+            },
+            QuestionType::Score => Answer::Score {
+                score: num(a, "score")?,
+                confidence: a["confidence"].as_f64().unwrap_or(0.0),
+                // Keyed by level index, like System One.
+                probabilities: a["probabilities"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| Some((p["value"].as_u64()?.to_string(), p["probability"].as_f64()?)))
+                    .collect(),
+            },
+        };
+        answers.insert(q.id.clone(), answer);
+    }
+    Ok(Assessment {
+        model: resp["model"].as_str().unwrap_or(fallback_model).to_string(),
+        answers,
+        notes,
+        input_tokens: resp["usage"]["input_tokens"].as_u64(),
+    })
+}
+
+impl Backend for OpenAi {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn assess(&self, episode: &Value) -> anyhow::Result<Assessment> {
+        let body = openai_request(&self.model, &self.assessment, episode);
+        let resp = post_json(&self.agent, &self.url, self.key.as_deref(), &body)?;
+        parse_openai(&self.assessment.questions, &resp, &self.model)
     }
 }
 
@@ -198,7 +352,7 @@ impl Local {
             name: name.to_string(),
             // The first call may load the model from disk (about 45 s for the 27B model).
             agent: agent(Duration::from_secs(def.timeout_secs())),
-            url: format!("{}/api/chat", def.url.trim_end_matches('/')),
+            url: def.endpoint().with_context(|| format!("backend {name}"))?,
             key: def.api_key().with_context(|| format!("backend {name}"))?,
             model: model.unwrap_or(&def.model).to_string(),
             assessment,
@@ -362,6 +516,75 @@ mod tests {
     fn reply(tokens: &[(&str, f64)]) -> Value {
         let top: Vec<Value> = tokens.iter().map(|(t, p)| json!({ "token": t, "logprob": p.ln() })).collect();
         json!({ "logprobs": [{ "top_logprobs": top }] })
+    }
+
+    fn three_questions() -> AssessmentConfig {
+        serde_saphyr::from_str(
+            "questions:\n  \
+             - {id: risky, type: noul, instructions: Is it risky?, yes_means: risky, no_means: fine}\n  \
+             - {id: team, type: choice, instructions: Which team?, options: [{name: secops, means: Security}, {name: it}]}\n  \
+             - {id: severity, type: score, instructions: How bad?, levels: [low, medium, high]}\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn systemone_plain_and_cloudflare_wrapped() {
+        let a = three_questions();
+        let body = json!({
+            "model": "clef",
+            "answers": {
+                "risky": { "type": "noul", "noul": 0.9 },
+                "team": { "type": "choice", "choice": "secops", "confidence": 0.8, "probabilities": { "secops": 0.85, "it": 0.15 } },
+                "severity": { "type": "score", "score": 1.7, "confidence": 0.55, "probabilities": { "0": 0.1, "1": 0.1, "2": 0.8 } },
+            },
+            "usage": { "input_tokens": 321 },
+        });
+        for resp in [body.clone(), json!({ "result": body, "success": true, "errors": [], "messages": [] })] {
+            let got = parse_systemone(&a.questions, &resp, "fallback").unwrap();
+            assert_eq!((got.model.as_str(), got.input_tokens), ("clef", Some(321)));
+            assert!(matches!(got.answers["risky"], Answer::Noul { noul } if noul == 0.9));
+            assert!(matches!(&got.answers["team"], Answer::Choice { choice, .. } if choice == "secops"));
+            assert!(matches!(got.answers["severity"], Answer::Score { score, .. } if score == 1.7));
+        }
+    }
+
+    #[test]
+    fn openai_request_translates_question_types() {
+        let req = openai_request("gpt-6-luna", &three_questions(), &json!({ "episode_id": "ep-1" }));
+        assert_eq!(req["model"], "gpt-6-luna");
+        assert_eq!(req["input"][1]["content"][0], json!({ "type": "input_json", "data": { "episode_id": "ep-1" } }));
+        let q = &req["questions"];
+        assert_eq!(q[0]["type"], "predicate");
+        assert_eq!(q[0]["instructions"], "Is it risky?\nTrue means: risky\nFalse means: fine");
+        assert_eq!(q[1]["choices"], json!([{ "value": "secops", "description": "Security" }, { "value": "it", "description": "it" }]));
+        assert_eq!(q[2]["levels"][2], json!({ "label": "high", "description": "high" }));
+    }
+
+    #[test]
+    fn openai_response_with_a_refusal() {
+        let a = three_questions();
+        // Shapes from the OpenAI Decisions guide.
+        let resp = json!({
+            "answers": [
+                { "type": "predicate", "name": "risky", "probability": 0.92 },
+                { "type": "choice", "name": "team", "choice": "secops", "confidence": 0.93,
+                  "probabilities": [{ "value": "secops", "probability": 0.95 }, { "value": "it", "probability": 0.05 }] },
+                { "type": "refusal", "name": "severity" },
+            ],
+            "usage": { "input_tokens": 512 },
+        });
+        let got = parse_openai(&a.questions, &resp, "gpt-6-luna").unwrap();
+        assert!(matches!(got.answers["risky"], Answer::Noul { noul } if noul == 0.92));
+        let Answer::Choice { probabilities, .. } = &got.answers["team"] else { panic!() };
+        assert_eq!(probabilities["secops"], 0.95);
+        // Refused: no answer (policies see it as unknown), plus a note.
+        assert!(!got.answers.contains_key("severity"));
+        assert_eq!(got.notes, ["severity: refused"]);
+        assert_eq!((got.model.as_str(), got.input_tokens), ("gpt-6-luna", Some(512)));
+        // A missing answer (not a refusal) is an error.
+        let partial = json!({ "answers": [{ "type": "predicate", "name": "risky", "probability": 0.5 }] });
+        assert!(parse_openai(&a.questions, &partial, "m").unwrap_err().to_string().contains("no answer for 'team'"));
     }
 
     #[test]

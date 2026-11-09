@@ -17,7 +17,7 @@ use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
 
 use crate::{
-    assess::{Answer, Assessment, Backend, Jev, Local},
+    assess::{Answer, Assessment, Backend, Local, OpenAi, SystemOne},
     backends::{self, BackendType},
     config,
     episode::{Baseline, Episode, Tracker},
@@ -86,7 +86,7 @@ pub struct ClassifyArgs {
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
-/// Model input tokens used so far (Jev bills input tokens).
+/// Model input tokens used so far (hosted decision APIs bill input tokens).
 static INPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn on_sigint(_: libc::c_int) {
@@ -121,7 +121,8 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let backend: Option<Box<dyn Backend>> = match &selected {
         None => None,
         Some((name, def)) => Some(match def.kind {
-            BackendType::Jev => Box::new(Jev::new(name, def, model, assessment.clone())?),
+            BackendType::Systemone => Box::new(SystemOne::new(name, def, model, assessment.clone())?),
+            BackendType::Openai => Box::new(OpenAi::new(name, def, model, assessment.clone())?),
             BackendType::Ollama => Box::new(Local::new(name, def, model, assessment.clone())?),
         }),
     };

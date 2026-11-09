@@ -104,21 +104,27 @@ policies:
 
 # Model backends. `classify --backend <name>` picks one; without it, `backend:` below.
 # `none` is built in: build episodes and print them without asking a model.
-#   type          jev (Jev's System One API; self-hosted Kev and Von speak it too)
-#                 or ollama (local chat model, one token per question; slow)
-#   url           base URL
+#   type          systemone  Jev's System One API (POST <url>/v1/systemone), also spoken by
+#                            Kev, Laya (laya-serve), Liquid d1 and Cloudflare Clef.
+#                            `jev` still works as an older name for it.
+#                 openai     OpenAI Decisions API (POST <url>/v1/decisions)
+#                 ollama     local chat model, one token per question (slow)
+#   url           base URL; may contain ${NAME} placeholders read from the environment or
+#                 ./.env (e.g. a Cloudflare account id)
+#   path          request path after url (default /v1/systemone, /v1/decisions, /api/chat)
 #   model         model name sent with each request (classify --model overrides it)
 #   api_key_env   NAME of the environment variable holding the API key, sent as
 #                 "Authorization: Bearer <key>". dnom also reads that name from ./.env.
 #                 Never put the key itself here. Leave out for backends without auth.
 #                 A key is only allowed over https://, unless the url is this machine.
-#   timeout_secs  per request; default 60 (jev) / 300 (ollama)
+#   timeout_secs  per request; default 60 (systemone, openai) / 300 (ollama)
 # Backends whose url is not this machine need classify --only or --allow-all-remote.
+# Only jev has been tested live; the other entries follow each provider's docs.
 backend: jev
 
 backends:
   jev:
-    type: jev
+    type: systemone
     url: https://api.typesafe.ai
     model: jev-latest
     api_key_env: TYPESAFE_API_KEY
@@ -128,13 +134,43 @@ backends:
     url: http://127.0.0.1:11434
     model: qwen3.6:27b-q8_0
 
-  # Self-hosted Jev-compatible model (github.com/jaredpalmer/kev), same API, no data leaves:
-  # kev:
-  #   type: jev
-  #   url: http://127.0.0.1:8009
-  #   model: kev-latest
+  # --- More providers: uncomment to use. Self-hosted entries keep data on this machine. ---
 
-# Assessment: what is sent to Jev (or the local model) with each episode.
+  # Kev, self-hosted (github.com/jaredpalmer/kev); `make kev-serve` starts Kev-0.8B on port 8009.
+  kev:
+    type: systemone
+    url: http://127.0.0.1:8009
+    model: kev-latest
+
+  # Laya, self-hosted (convaiinnovations/laya): pip install "laya[serve]" && laya-serve  (port 8000)
+  # laya:
+  #   type: systemone
+  #   url: http://127.0.0.1:8000
+  #   model: laya
+
+  # Liquid AI d1, hosted
+  # liquid:
+  #   type: systemone
+  #   url: https://api.liquid.ai/decisions
+  #   model: d1
+  #   api_key_env: LIQUID_API_KEY
+
+  # Cloudflare Clef on Workers AI (model: clef or clef-flash; path names the model too)
+  # clef:
+  #   type: systemone
+  #   url: https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}
+  #   path: /ai/run/@cf/cloudflare/clef
+  #   model: clef
+  #   api_key_env: CLOUDFLARE_API_TOKEN
+
+  # OpenAI Decisions API, hosted
+  # openai:
+  #   type: openai
+  #   url: https://api.openai.com
+  #   model: gpt-6-luna
+  #   api_key_env: OPENAI_API_KEY
+
+# Assessment: what is sent to the model backend with each episode.
 # context goes to Jev as state.context; questions are asked in this order and the
 # terminal summary uses the same order. Leave out context or questions to use the
 # built-in ones (dnom/src/default_assessment.yaml).
