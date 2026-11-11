@@ -19,6 +19,8 @@ const ARGV_CAP: usize = 256;
 const TREE_CAP: usize = 25;
 const FILES_CAP: usize = 15;
 const NET_CAP: usize = 15;
+const TRAIL_CAP: usize = 100;
+const TRIPWIRE_ROOM: usize = 20;
 const SHELLS: &[&str] = &["bash", "sh", "zsh", "fish", "dash", "ksh", "nu"];
 const PACKAGE_MANAGERS: &[&str] = &[
     "npm", "npx", "node", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "gem", "composer",
@@ -41,10 +43,25 @@ pub struct Proc {
 
 pub struct TreeEntry {
     pub pid: u32,
+    pub ppid: Option<u32>,
+    pub ts_ms: u64,
     pub exe: String,
     pub argv: String,
     pub parent: String,
     execd: bool,
+}
+
+/// One step of an episode's audit trail: a process opened a categorized file or connected
+/// somewhere. Kept in order with the process that did it; for people, not sent to the model.
+pub struct TrailEntry {
+    pub ts_ms: u64,
+    pub pid: u32,
+    pub what: Trail,
+}
+
+pub enum Trail {
+    Open { path: String, category: &'static str, write: bool },
+    Net { dest: String, new: bool, decoy: bool },
 }
 
 pub struct NetEntry {
@@ -70,6 +87,12 @@ pub struct Episode {
     pub files: BTreeMap<&'static str, BTreeSet<String>>,
     pub other_opens: u64,
     pub net: Vec<NetEntry>,
+    /// Decoy addresses (`decoys.addresses`) this episode tried to reach. Kept apart from
+    /// `net`, which stops at NET_CAP: a scan's decoy hit must not be lost behind the cap.
+    pub decoy_net: BTreeSet<String>,
+    pub trail: Vec<TrailEntry>,
+    trail_seen: HashSet<(u32, String)>,
+    pub trail_truncated: usize,
     pub flags: BTreeSet<String>,
     /// Bumped on every meaningful change; compared with `assessed_version`.
     pub version: u64,
@@ -79,6 +102,19 @@ pub struct Episode {
 }
 
 impl Episode {
+    /// Records a trail step once per process and target (a file read in a loop is one step).
+    /// Tripwire steps (`always`) get room past the cap: they are what the reader looks for.
+    fn push_trail(&mut self, ts_ms: u64, pid: u32, key: &str, what: Trail, always: bool) {
+        if !self.trail_seen.insert((pid, key.to_string())) {
+            return;
+        }
+        if self.trail.len() >= TRAIL_CAP + if always { TRIPWIRE_ROOM } else { 0 } {
+            self.trail_truncated += 1;
+            return;
+        }
+        self.trail.push(TrailEntry { ts_ms, pid, what });
+    }
+
     fn mark_changed(&mut self, ts: u64) {
         self.version += 1;
         self.last_change_ms = ts;
@@ -86,11 +122,8 @@ impl Episode {
     }
 
     pub fn sensitive_count(&self) -> usize {
-        self.files
-            .iter()
-            .filter(|(cat, _)| paths::is_sensitive(cat))
-            .map(|(_, set)| set.len())
-            .sum()
+        self.decoy_net.len()
+            + self.files.iter().filter(|(cat, _)| paths::is_sensitive(cat)).map(|(_, set)| set.len()).sum::<usize>()
     }
 
     pub fn needs_assessment(&self) -> bool {
@@ -121,7 +154,25 @@ impl Episode {
         let mut tree: Vec<Value> = self
             .tree
             .iter()
-            .map(|t| json!({ "pid": t.pid, "exe": tidy(&t.exe), "argv": tidy(&t.argv), "parent": t.parent }))
+            .map(|t| {
+                json!({ "pid": t.pid, "ppid": t.ppid, "ts_ms": t.ts_ms, "exe": tidy(&t.exe), "argv": tidy(&t.argv), "parent": t.parent })
+            })
+            .collect();
+        let trail: Vec<Value> = self
+            .trail
+            .iter()
+            .map(|t| match &t.what {
+                Trail::Open { path, category, write } => {
+                    json!({ "ts_ms": t.ts_ms, "pid": t.pid, "event": "open", "path": tidy(path), "category": category, "write": write })
+                }
+                Trail::Net { dest, new, decoy } => {
+                    let mut step = json!({ "ts_ms": t.ts_ms, "pid": t.pid, "event": "net", "dest": dest, "new_destination": new });
+                    if *decoy {
+                        step["decoy"] = json!(true);
+                    }
+                    step
+                }
+            })
             .collect();
         if self.tree_truncated > 0 {
             tree.push(json!({ "more_processes_not_shown": self.tree_truncated }));
@@ -140,7 +191,14 @@ impl Episode {
             "other_file_opens": self.other_opens,
             "network": self.net.iter().map(|n| json!({ "dest": n.dest, "by": n.by, "new_destination": n.new })).collect::<Vec<_>>(),
             "flags": self.flags,
+            "trail": trail,
         });
+        if self.trail_truncated > 0 {
+            v["trail_truncated"] = json!(self.trail_truncated);
+        }
+        if !self.decoy_net.is_empty() {
+            v["decoy_destinations"] = json!(self.decoy_net);
+        }
         // Only when known, so host episodes look exactly as before. The container id is left
         // out: it means nothing to the model.
         if let Some(c) = &self.container {
@@ -154,6 +212,33 @@ impl Episode {
         }
         v
     }
+}
+
+/// The episode as a model sees it: the full record without the parts kept for people.
+/// - `files.decoys` and `files.dnom_config`: a tripwire file stays listed under its normal
+///   category (or counted in `other_file_opens`), so the model's answers remain an
+///   independent check on the alert.
+/// - `decoy_destinations`: a decoy address stays in `network` like any other destination.
+/// - the audit trail and the tree's `ppid` / `ts_ms`.
+pub fn model_view(episode: &Value) -> Value {
+    let mut v = episode.clone();
+    if let Some(o) = v.as_object_mut() {
+        o.remove("trail");
+        o.remove("trail_truncated");
+        o.remove("decoy_destinations");
+    }
+    if let Some(files) = v["files"].as_object_mut() {
+        for kind in paths::TRIPWIRES {
+            files.remove(kind);
+        }
+    }
+    for t in v["tree"].as_array_mut().into_iter().flatten() {
+        if let Some(o) = t.as_object_mut() {
+            o.remove("ppid");
+            o.remove("ts_ms");
+        }
+    }
+    v
 }
 
 /// Things seen before on this machine (SPEC §4.2 local baseline).
@@ -195,6 +280,9 @@ pub struct Tracker {
     pub baseline: Baseline,
     /// Until this time (Unix ms) the baseline only learns and raises no `new_*` flags.
     pub learn_until_ms: u64,
+    /// This program's own path: dnom reading its config is not a tripwire.
+    own_exe: Option<String>,
+    decoy_addresses: crate::decoys::Addresses,
     /// Look up processes we haven't seen fork in this machine's /proc. Off when the events
     /// come from another machine (a VM), where these pids mean something else.
     local_proc: bool,
@@ -203,6 +291,8 @@ pub struct Tracker {
 impl Tracker {
     pub fn new(config: Config, baseline: Baseline, learn_until_ms: u64) -> Self {
         Self {
+            // Checked when the config was loaded; a hand-built config with a bad entry has none.
+            decoy_addresses: crate::decoys::Addresses::parse(&config.decoys.addresses).unwrap_or_default(),
             config,
             own_pid: std::process::id(),
             procs: HashMap::new(),
@@ -210,6 +300,7 @@ impl Tracker {
             episodes: HashMap::new(),
             baseline,
             learn_until_ms,
+            own_exe: std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()),
             local_proc: true,
         }
     }
@@ -219,7 +310,13 @@ impl Tracker {
     pub fn remote(mut self) -> Self {
         self.local_proc = false;
         self.own_pid = 0;
+        self.own_exe = None;
         self
+    }
+
+    /// The decoys generated for this run (replaced when they are rotated).
+    pub fn set_generated_decoys(&mut self, paths: Vec<String>) {
+        self.config.paths.generated = paths;
     }
 
     pub fn ingest(&mut self, ev: Event) {
@@ -290,6 +387,7 @@ impl Tracker {
             .map(|r| r.name.clone());
         let parent_name = self.parent_name(pid);
         let Some(p) = self.procs.get_mut(&pid) else { return };
+        let ppid = p.ppid;
         p.exe = exe.clone();
         p.argv = argv.clone();
         p.comm = comm.clone();
@@ -318,7 +416,7 @@ impl Tracker {
             ep.root_exe = exe.clone();
             ep.root_argv = cap(&shown_argv);
         }
-        push_tree(ep, pid, &exe, &shown_argv, &parent_name, true);
+        push_tree(ep, pid, ppid, ts, &exe, &shown_argv, &parent_name, true);
         if is_new_exe && !learning {
             ep.flags.insert("new_exe".into());
         }
@@ -341,8 +439,15 @@ impl Tracker {
             let category = self.config.paths.categorize(&format!("/{path}"), write);
             (format!("?/{path}"), category)
         };
-        let sensitive = category.is_some_and(paths::is_sensitive);
         let Some(p) = self.procs.get(&pid) else { return };
+        // A decoy, or dnom's config opened by anything but dnom itself (another `dnom classify`
+        // reads it too).
+        let tripwire = self
+            .config
+            .paths
+            .tripwire(&path)
+            .filter(|t| *t != paths::OWN_CONFIG || self.own_exe.as_deref() != Some(p.exe.as_str()));
+        let sensitive = tripwire.is_some() || category.is_some_and(paths::is_sensitive);
         let ignored = p.ignored.clone();
         if ignored.is_some() && !sensitive {
             return;
@@ -354,8 +459,19 @@ impl Tracker {
         if ignored.is_some() {
             ep.flags.insert("sensitive_in_ignored_tree".into());
         }
+        // A tripwire file is listed as one and also under its normal category, like any other.
+        if let Some(kind) = tripwire {
+            ep.push_trail(ts, pid, &path, Trail::Open { path: path.clone(), category: kind, write }, true);
+            let set = ep.files.entry(kind).or_default();
+            if set.len() < FILES_CAP && set.insert(path.clone()) {
+                ep.mark_changed(ts);
+            }
+        }
         match category {
             Some(cat) => {
+                if tripwire.is_none() && paths::is_sensitive(cat) {
+                    ep.push_trail(ts, pid, &path, Trail::Open { path: path.clone(), category: cat, write }, false);
+                }
                 let set = ep.files.entry(cat).or_default();
                 if set.len() < FILES_CAP && set.insert(path) && sensitive {
                     ep.mark_changed(ts);
@@ -367,7 +483,10 @@ impl Tracker {
 
     fn on_net(&mut self, pid: u32, dest: String, ts: u64, learning: bool) {
         let Some(p) = self.procs.get(&pid) else { return };
-        if p.ignored.is_some() {
+        // An attempt to reach a decoy address counts wherever it comes from, like a decoy file.
+        let decoy = self.decoy_addresses.matches(&dest);
+        let ignored = p.ignored.is_some();
+        if ignored && !decoy {
             return;
         }
         let root = p.root;
@@ -380,6 +499,13 @@ impl Tracker {
         self.ensure_episode(root, ts);
         let ep = self.episodes.get_mut(&root).expect("episode just ensured");
         ep.last_ms = ep.last_ms.max(ts);
+        ep.push_trail(ts, pid, &dest, Trail::Net { dest: dest.clone(), new: is_new, decoy }, decoy);
+        if ignored {
+            ep.flags.insert("sensitive_in_ignored_tree".into());
+        }
+        if decoy && ep.decoy_net.len() < NET_CAP && ep.decoy_net.insert(dest.clone()) {
+            ep.mark_changed(ts);
+        }
         if ep.net.iter().any(|n| n.dest == dest && n.by == by) {
             return;
         }
@@ -501,10 +627,10 @@ impl Tracker {
             return;
         }
         let parent_name = self.parent_name(root);
-        let (exe, argv, uid, container) = self
+        let (exe, argv, uid, container, ppid) = self
             .procs
             .get(&root)
-            .map(|p| (p.exe.clone(), self.config.redact.redact_argv(&p.argv), p.uid, p.container.clone()))
+            .map(|p| (p.exe.clone(), self.config.redact.redact_argv(&p.argv), p.uid, p.container.clone(), p.ppid))
             .unwrap_or_default();
         let mut ep = Episode {
             id: format!("ep-{root}-{:05x}", ts & 0xfffff),
@@ -522,13 +648,17 @@ impl Tracker {
             files: BTreeMap::new(),
             other_opens: 0,
             net: Vec::new(),
+            decoy_net: BTreeSet::new(),
+            trail: Vec::new(),
+            trail_seen: HashSet::new(),
+            trail_truncated: 0,
             flags: BTreeSet::new(),
             version: 0,
             assessed_version: 0,
             first_unassessed_ms: None,
             last_change_ms: ts,
         };
-        push_tree(&mut ep, root, &exe, &argv, &parent_name, false);
+        push_tree(&mut ep, root, ppid, ts, &exe, &argv, &parent_name, false);
         self.episodes.insert(root, ep);
     }
 
@@ -550,7 +680,8 @@ impl Tracker {
 
 /// Adds a tree entry. An exec replaces the pid's entry if that entry was only a placeholder
 /// (the process seen before its exec) and otherwise appends, so exec chains stay visible.
-fn push_tree(ep: &mut Episode, pid: u32, exe: &str, argv: &str, parent: &str, execd: bool) {
+#[allow(clippy::too_many_arguments)]
+fn push_tree(ep: &mut Episode, pid: u32, ppid: Option<u32>, ts_ms: u64, exe: &str, argv: &str, parent: &str, execd: bool) {
     let first_time = ep.tree_pids.insert(pid);
     if let Some(last) = ep.tree.iter_mut().rev().find(|t| t.pid == pid) {
         if last.exe == exe && last.argv == cap(argv) {
@@ -561,6 +692,7 @@ fn push_tree(ep: &mut Episode, pid: u32, exe: &str, argv: &str, parent: &str, ex
             last.exe = exe.to_string();
             last.argv = cap(argv);
             last.execd = true;
+            last.ts_ms = ts_ms;
             return;
         }
     }
@@ -572,6 +704,8 @@ fn push_tree(ep: &mut Episode, pid: u32, exe: &str, argv: &str, parent: &str, ex
     }
     ep.tree.push(TreeEntry {
         pid,
+        ppid,
+        ts_ms,
         exe: exe.to_string(),
         argv: cap(argv),
         parent: parent.to_string(),
@@ -728,6 +862,127 @@ mod tests {
 
         let json = t.episodes[&sh].to_json("/root");
         assert_eq!(json["container"], json!({ "name": "web", "image": "nginx:1.27", "pod": "web-7f9c", "namespace": "prod" }));
+    }
+
+    /// A decoy read marks the episode for policies and the audit record, but the model sees
+    /// the file only as an ordinary one, so its answers stay an independent check.
+    #[test]
+    fn decoy_read_is_recorded_but_hidden_from_the_model() {
+        let mut config = Config::default();
+        config.paths.decoys = vec!["/srv/backup/db-credentials.txt".into(), "/opt/keys-old/".into()];
+        let mut t = Tracker::new(config, Baseline::default(), 0).remote();
+        let (sh, cat) = (4_190_501, 4_190_502);
+        t.ingest(ev(0, sh, 1000, "sh", exec("/bin/sh", &["sh", "-c", "cat files"])));
+        t.ingest(ev(1, sh, 1000, "sh", Data::Fork { child: cat }));
+        t.ingest(ev(2, cat, 1000, "cat", exec("/bin/cat", &["cat", "files"])));
+        t.ingest(ev(3, cat, 1000, "cat", Data::Open { path: "/srv/backup/db-credentials.txt".into(), flags: 0, write: false }));
+        t.ingest(ev(4, cat, 1000, "cat", Data::Open { path: "/opt/keys-old/.ssh/id_rsa".into(), flags: 0, write: false }));
+        t.ingest(ev(5, cat, 1000, "cat", Data::Open { path: "/srv/backup/readme.txt".into(), flags: 0, write: false }));
+
+        let ep = &t.episodes[&sh];
+        assert!(ep.passes_prefilter(false), "a decoy read alone gets the episode assessed");
+        let full = ep.to_json("/root");
+        assert_eq!(full["files"]["decoys"], json!(["/opt/keys-old/.ssh/id_rsa", "/srv/backup/db-credentials.txt"]));
+        assert_eq!(full["files"]["credentials"], json!(["/opt/keys-old/.ssh/id_rsa"]), "normal category kept");
+        assert_eq!(full["other_file_opens"], 2, "the plain-named decoy and the readme");
+
+        let seen = model_view(&full);
+        assert!(seen["files"].get("decoys").is_none());
+        assert_eq!(seen["files"]["credentials"], full["files"]["credentials"]);
+        assert!(!seen.to_string().contains("decoy"), "{seen}");
+        assert!(seen.get("trail").is_none() && seen["tree"][0].get("ppid").is_none());
+    }
+
+    /// dnom's config lists the decoys and the rules: another program opening it is a signal.
+    /// dnom itself (a second `dnom classify`) reading it is not.
+    #[test]
+    fn own_config_is_a_tripwire_for_other_programs() {
+        let mut config = Config::default();
+        config.paths.own_config = vec!["/etc/dnom/dnom.yaml".into()];
+        let mut t = Tracker::new(config, Baseline::default(), 0).remote();
+        t.own_exe = Some("/usr/bin/dnom".into());
+        let (sh, cat, dnom) = (4_190_701, 4_190_702, 4_190_703);
+        t.ingest(ev(0, sh, 1000, "sh", exec("/bin/sh", &["sh"])));
+        t.ingest(ev(1, sh, 1000, "sh", Data::Fork { child: dnom }));
+        t.ingest(ev(2, dnom, 1000, "dnom", exec("/usr/bin/dnom", &["dnom", "classify"])));
+        t.ingest(ev(3, dnom, 1000, "dnom", Data::Open { path: "/etc/dnom/dnom.yaml".into(), flags: 0, write: false }));
+        assert!(t.episodes[&sh].to_json("/root")["files"].get("dnom_config").is_none(), "dnom reading its own config");
+
+        t.ingest(ev(4, sh, 1000, "sh", Data::Fork { child: cat }));
+        t.ingest(ev(5, cat, 1000, "cat", exec("/bin/cat", &["cat", "/etc/dnom/dnom.yaml"])));
+        t.ingest(ev(6, cat, 1000, "cat", Data::Open { path: "/etc/dnom/dnom.yaml".into(), flags: 0, write: false }));
+        let full = t.episodes[&sh].to_json("/root");
+        assert_eq!(full["files"]["dnom_config"], json!(["/etc/dnom/dnom.yaml"]));
+        assert_eq!(full["trail"][0], json!({ "ts_ms": 6, "pid": cat, "event": "open", "path": "/etc/dnom/dnom.yaml", "category": "dnom_config", "write": false }));
+        assert!(model_view(&full)["files"].get("dnom_config").is_none());
+    }
+
+    /// A scan: many connection attempts, one of them to a decoy address, late. The hit must
+    /// survive the per-episode network cap and the trail cap, and stay out of the model's view.
+    #[test]
+    fn decoy_address_hit_survives_a_scan() {
+        let mut config = Config::default();
+        config.decoys.addresses = vec!["10.43.0.200".into(), "127.0.0.1:6379".into()];
+        let mut t = Tracker::new(config, Baseline::default(), 0).remote();
+        let scan = 4_190_801;
+        t.ingest(ev(0, scan, 1000, "nmap", exec("/usr/bin/nmap", &["nmap", "10.43.0.0/24"])));
+        for host in 1..=254u64 {
+            t.ingest(ev(host, scan, 1000, "nmap", Data::Net { op: "connect".into(), dest: format!("10.43.0.{host}:22") }));
+        }
+        t.ingest(ev(300, scan, 1000, "nmap", Data::Net { op: "connect".into(), dest: "127.0.0.1:6379".into() }));
+        t.ingest(ev(301, scan, 1000, "nmap", Data::Net { op: "connect".into(), dest: "127.0.0.1:6380".into() }));
+
+        let ep = &t.episodes[&scan];
+        let full = ep.to_json("/root");
+        assert_eq!(full["decoy_destinations"], json!(["10.43.0.200:22", "127.0.0.1:6379"]));
+        assert_eq!(full["network"].as_array().unwrap().len(), NET_CAP, "the ordinary list still stops at its cap");
+        let decoy_steps: Vec<&str> =
+            full["trail"].as_array().unwrap().iter().filter(|s| s["decoy"] == true).map(|s| s["dest"].as_str().unwrap()).collect();
+        assert_eq!(decoy_steps, ["10.43.0.200:22", "127.0.0.1:6379"], "both hits are in the trail, past its cap");
+        assert!(model_view(&full).get("decoy_destinations").is_none());
+
+        // The hit alone gets an episode assessed, also from an ignored program.
+        let mut config = Config::default();
+        config.decoys.addresses = vec!["10.43.0.200".into()];
+        config.ignore = vec![crate::config::IgnoreRule { name: "tool".into(), exe: Some("/opt/tool".into()), exe_prefix: None, comm: None, argv_contains: None }];
+        let mut t = Tracker::new(config, Baseline::default(), u64::MAX).remote();
+        t.ingest(ev(0, scan, 1000, "tool", exec("/opt/tool", &["tool"])));
+        t.ingest(ev(1, scan, 1000, "tool", Data::Net { op: "connect".into(), dest: "10.43.0.9:22".into() }));
+        assert!(!t.episodes.contains_key(&scan), "an ignored program's ordinary connections stay ignored");
+        t.ingest(ev(2, scan, 1000, "tool", Data::Net { op: "connect".into(), dest: "10.43.0.200:5432".into() }));
+        let ep = &t.episodes[&scan];
+        assert!(ep.passes_prefilter(false) && ep.flags.contains("sensitive_in_ignored_tree"));
+        assert_eq!(ep.to_json("/root")["decoy_destinations"], json!(["10.43.0.200:5432"]));
+    }
+
+    /// The audit trail says which process did what, in order, and the tree knows parents.
+    #[test]
+    fn trail_and_tree_parents() {
+        let mut t = Tracker::new(Config::default(), Baseline::default(), 0).remote();
+        let (sh, cat, curl) = (4_190_601, 4_190_602, 4_190_603);
+        t.ingest(ev(10, sh, 1000, "sh", exec("/bin/sh", &["sh", "x.sh"])));
+        t.ingest(ev(11, sh, 1000, "sh", Data::Fork { child: cat }));
+        t.ingest(ev(12, cat, 1000, "cat", exec("/bin/cat", &["cat", "/home/a/.ssh/id_ed25519"])));
+        for ts in [13, 14] {
+            t.ingest(ev(ts, cat, 1000, "cat", Data::Open { path: "/home/a/.ssh/id_ed25519".into(), flags: 0, write: false }));
+        }
+        t.ingest(ev(15, cat, 1000, "cat", Data::Open { path: "/home/a/notes.txt".into(), flags: 0, write: false }));
+        t.ingest(ev(16, sh, 1000, "sh", Data::Fork { child: curl }));
+        t.ingest(ev(17, curl, 1000, "curl", exec("/usr/bin/curl", &["curl", "https://203.0.113.7/"])));
+        t.ingest(ev(18, curl, 1000, "curl", Data::Net { op: "connect".into(), dest: "203.0.113.7:443".into() }));
+
+        let json = t.episodes[&sh].to_json("/home/a");
+        let tree: Vec<(u64, Option<u64>, u64)> =
+            json["tree"].as_array().unwrap().iter().map(|n| (n["pid"].as_u64().unwrap(), n["ppid"].as_u64(), n["ts_ms"].as_u64().unwrap())).collect();
+        assert_eq!(tree, vec![(sh as u64, None, 10), (cat as u64, Some(sh as u64), 12), (curl as u64, Some(sh as u64), 17)]);
+        assert_eq!(
+            json["trail"],
+            json!([
+                { "ts_ms": 13, "pid": cat, "event": "open", "path": "~/.ssh/id_ed25519", "category": "credentials", "write": false },
+                { "ts_ms": 18, "pid": curl, "event": "net", "dest": "203.0.113.7:443", "new_destination": true },
+            ]),
+            "one step per process and target; uncategorized opens are only counted"
+        );
     }
 
     fn exec(exe: &str, argv: &[&str]) -> Data {

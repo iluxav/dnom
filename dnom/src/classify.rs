@@ -3,7 +3,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError},
@@ -20,6 +20,7 @@ use crate::{
     assess::{Answer, Assessment, Backend, Local, OpenAi, SystemOne},
     backends::{self, BackendType},
     config,
+    decoys::Planted,
     episode::{Baseline, Episode, Tracker},
     event::{Data, Event},
     policy::{Match, Policies},
@@ -97,12 +98,26 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// Model input tokens used so far (hosted decision APIs bill input tokens).
 static INPUT_TOKENS: AtomicU64 = AtomicU64::new(0);
 
+/// Ctrl-C, `kill`, or the terminal closing: stop the loop so the run ends cleanly (baseline
+/// saved, generated decoys removed).
 extern "C" fn on_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
 pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
-    let (config, config_path) = config::load(args.config.as_deref())?;
+    let (mut config, config_path) = config::load(args.config.as_deref())?;
+    // The config is a tripwire: another program opening it is reported (files.dnom_config).
+    // Only on this machine; paths in events from another machine are that machine's.
+    if !args.remote_source
+        && let Some(path) = &config_path
+    {
+        for form in [std::path::absolute(path).ok(), fs::canonicalize(path).ok()].into_iter().flatten() {
+            let form = form.to_string_lossy().into_owned();
+            if !config.paths.own_config.contains(&form) {
+                config.paths.own_config.push(form);
+            }
+        }
+    }
     let selected = backends::select(&config.backends, &config.backend, args.backend.as_deref())?;
     if let Some((name, def)) = &selected
         && def.is_remote()
@@ -120,6 +135,14 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".local/state/dnom"),
     };
     fs::create_dir_all(&state_dir).with_context(|| format!("create {}", state_dir.display()))?;
+    // Generated decoys only make sense for a live run on this machine. Their list is a
+    // tripwire like the config.
+    let live_here = args.input.is_none() && !args.remote_source;
+    let decoy_config = config.decoys.clone();
+    if live_here {
+        let list = Planted::state_path(&state_dir);
+        config.paths.own_config.push(std::path::absolute(&list).unwrap_or(list).to_string_lossy().into_owned());
+    }
     let baseline_path = state_dir.join("baseline.json");
     let log_path = state_dir.join("assessments.jsonl");
 
@@ -149,13 +172,25 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     let rx = spawn_reader(args.input.clone(), args.source)?;
     let ignore_count = config.ignore.len();
 
-    unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe { libc::signal(signal, on_sigint as *const () as libc::sighandler_t) };
+    }
 
     let home = args.home.clone().unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let _ = HOME.set(home.trim_end_matches('/').to_string());
     let mut tracker = Tracker::new(config, baseline, 0);
     if args.remote_source {
         tracker = tracker.remote();
+    }
+    // Planted last, once nothing else can fail on the way to the loop; removed when `planted`
+    // is dropped, on every way out of this function.
+    let mut planted = match std::env::var_os("HOME") {
+        Some(home) if live_here => Planted::start(&state_dir, Path::new(&home), &decoy_config.auto)?,
+        _ => None,
+    };
+    if let Some(p) = &planted {
+        tracker.set_generated_decoys(p.paths());
+        eprintln!("dnom classify: decoys planted: {}; removed when dnom stops", p.summary());
     }
     let (exes, dests) = tracker.baseline.len();
     eprintln!(
@@ -220,11 +255,19 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         if last_save.elapsed() > Duration::from_secs(30) {
             tracker.baseline.save(&baseline_path)?;
             last_save = Instant::now();
+            if let Some(p) = &mut planted
+                && p.rotation_due(decoy_config.rotate_days)
+            {
+                p.rotate()?;
+                tracker.set_generated_decoys(p.paths());
+                eprintln!("dnom classify: decoys rotated: {} new", p.summary());
+            }
         }
         if ended {
             break;
         }
     }
+    drop(planted);
     tracker.baseline.save(&baseline_path)?;
     let (exes, dests) = tracker.baseline.len();
     eprintln!(
@@ -343,12 +386,14 @@ fn tick(
     for &(_, _, root) in ready.iter().take(budget) {
         let Some(ep) = tracker.episodes.get_mut(&root) else { continue };
         let version = ep.version;
+        // The full record goes to the policies and the log; the model gets its own view of it
+        // (no decoy marking, no audit trail).
         let episode_json = ep.to_json(tracker_home());
         let result = match backend {
             None => None,
             Some(b) => {
                 let started = Instant::now();
-                match b.assess(&episode_json) {
+                match b.assess(&crate::episode::model_view(&episode_json)) {
                     Ok(a) => {
                         INPUT_TOKENS.fetch_add(a.input_tokens.unwrap_or(0), Ordering::Relaxed);
                         Some((b.name(), a, started.elapsed()))
@@ -440,7 +485,13 @@ fn log_record(
             "policy": policy,
             "episode": episode_json,
         }),
-        None => json!({ "episode_id": ep.id, "backend": "none", "policy": policy, "episode": episode_json }),
+        None => json!({
+            "ts": crate::episode::rfc3339(wall_ms()),
+            "episode_id": ep.id,
+            "backend": "none",
+            "policy": policy,
+            "episode": episode_json,
+        }),
     };
     // Dry runs (no model) are logged only when a rule matched, so the log stays useful.
     if result.is_some() || !matches.is_empty() {
@@ -495,6 +546,10 @@ fn report_body(
     if !net.is_empty() {
         writeln!(out, "  net:   {}", net.join(", "))?;
     }
+    let decoys: Vec<&str> = episode_json["decoy_destinations"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).collect();
+    if !decoys.is_empty() {
+        writeln!(out, "  decoy: connect {}", decoys.join(", "))?;
+    }
     let flags: Vec<&str> = episode_json["flags"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).collect();
     if !flags.is_empty() {
         writeln!(out, "  flags: {}", flags.join(", "))?;
@@ -512,6 +567,8 @@ fn category_label(category: &str) -> &str {
         "persistence" => "persist:",
         "system_binaries" => "bins:",
         "temp" => "temp:",
+        "decoys" => "decoy:",
+        "dnom_config" => "config:",
         other => other,
     }
 }
@@ -528,7 +585,7 @@ fn clock(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
         h ^= *b as u64;

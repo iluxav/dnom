@@ -1,6 +1,7 @@
 # dnom PoC: common commands. Run `make` to list them.
 #
-# Variables you can override: make run ONLY=fake-exfil, make falco QUIET=1, make replay BACKEND=local
+# Variables you can override: make run ONLY=fake-exfil, make falco QUIET=1, make replay BACKEND=local,
+# make audit EP=last THREATS=1
 # BACKEND is a name from `backends:` in dnom.yaml (or none); MODEL overrides its model.
 BIN          := target/release/dnom
 BACKEND      ?= jev
@@ -57,7 +58,7 @@ endif
 FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 
 .DEFAULT_GOAL := help
-.PHONY: help build test fmt run collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
+.PHONY: help build test fmt run monitor audit collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
         vm-push vm-run vm-fake-exfil vm-e2e vm-k3s \
         replay replay-dry bench log jev-check reset-baseline clean
@@ -81,6 +82,12 @@ fmt: ## Format code (needs nightly for rustfmt.toml options)
 
 run: build ## Live: collect | classify (BACKEND=<name in dnom.yaml>|none, ONLY=...)
 	sudo $(BIN) collect | $(BIN) classify $(CLASSIFY_FLAGS)
+
+monitor: build ## Live threat reports only, in a 2nd terminal next to `make run` (no sudo)
+	$(BIN) monitor
+
+audit: build ## Audit trail: assessed episodes; one in full with EP=<episode id or "last">
+	$(BIN) audit $(EP) $(if $(strip $(THREATS)),--threats)
 
 collect: build ## Live: raw JSON events
 	sudo $(BIN) collect

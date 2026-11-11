@@ -11,6 +11,9 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub paths: crate::paths::PathRules,
+    /// Decoy files: hand-placed paths and the kinds dnom generates itself.
+    #[serde(default)]
+    pub decoys: crate::decoys::DecoyConfig,
     #[serde(default)]
     pub redact: crate::redact::RedactRules,
     /// Context and typed questions sent with each episode; missing parts use the built-ins.
@@ -37,6 +40,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             paths: Default::default(),
+            decoys: Default::default(),
             redact: Default::default(),
             assessment: Default::default(),
             policies: Default::default(),
@@ -132,8 +136,10 @@ pub fn load(path: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)> {
         }
         let text = std::fs::read_to_string(candidate)
             .with_context(|| format!("read {}", candidate.display()))?;
-        let config: Config = serde_saphyr::from_str(&text)
+        let mut config: Config = serde_saphyr::from_str(&text)
             .with_context(|| format!("parse {}", candidate.display()))?;
+        config.paths.decoys = config.decoys.paths.clone();
+        config.decoys.validate().with_context(|| format!("{}", candidate.display()))?;
         config
             .paths
             .validate()

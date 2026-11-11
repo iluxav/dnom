@@ -52,13 +52,16 @@
 
 - rule: dnom_connect
   desc: >
-    Outbound IPv4/IPv6 connection attempt, successful or not, or UDP send to a new destination
-    (catch-all for dnom). A failed attempt is still a signal, e.g. an exfiltration try that
-    timed out. For those Falco leaves fd.sip empty; addr carries the destination.
+    Outbound IPv4/IPv6 connection attempt, successful or not, a UDP send to a new destination,
+    or a ping (ICMP or raw socket) to a new destination (catch-all for dnom). A failed attempt
+    is still a signal, e.g. an exfiltration try that timed out. For those Falco leaves fd.sip
+    empty; addr carries the destination. Falco reports ping sockets as connected, hence the
+    separate clause; fd.name_changed keeps it to one alert per destination.
   condition: >
     (evt.type = connect
      or (evt.type in (sendto, sendmsg) and fd.l4proto != tcp and fd.connected = false
-         and fd.name_changed = true))
+         and fd.name_changed = true)
+     or (evt.type in (sendto, sendmsg) and fd.l4proto in (icmp, raw) and fd.name_changed = true))
     and (fd.typechar = 4 or fd.typechar = 6)
     and dnom_not_self
   output: >-

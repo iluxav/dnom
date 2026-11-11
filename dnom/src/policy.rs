@@ -7,8 +7,8 @@
 //!   response == "contain"          response.contain >= 0.3       not fits_baseline > 0.5
 //! Fields: every question id (noul/score: number, choice: chosen option as a string,
 //! `<choice>.<option>`: that option's probability), plus episode facts: `flags` (list),
-//! `files.credentials` / `files.persistence` / `files.system_binaries` / `files.temp`
-//! (counts), `net.new` / `net.total` (destination counts), `procs`, `uid`, and, when the
+//! `files.credentials` / `files.persistence` / `files.system_binaries` / `files.temp` /
+//! `files.decoys` / `files.dnom_config` (counts), `net.new` / `net.total` / `net.decoys` (destination counts), `procs`, `uid`, and, when the
 //! source knows them (Falco), `container.name`, `container.image`, `k8s.pod`, `k8s.namespace`.
 //! A rule that needs a value the episode doesn't have (no backend, a failed call, a host
 //! episode for a container field) does not match.
@@ -38,8 +38,11 @@ const EPISODE_NUMBERS: &[&str] = &[
     "files.persistence",
     "files.system_binaries",
     "files.temp",
+    "files.decoys",
+    "files.dnom_config",
     "net.new",
     "net.total",
+    "net.decoys",
     "procs",
     "uid",
 ];
@@ -502,6 +505,7 @@ impl Ctx<'_> {
                 ep["flags"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).map(String::from).collect(),
             ),
             "net.total" => Val::Num(count(&ep["network"])),
+            "net.decoys" => Val::Num(count(&ep["decoy_destinations"])),
             "net.new" => Val::Num(
                 ep["network"].as_array().into_iter().flatten().filter(|n| n["new_destination"] == true).count() as f64,
             ),

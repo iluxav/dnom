@@ -17,6 +17,12 @@ def read_jsonl(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def latest(records):
+    """classify reassesses an episode when it changes (e.g. a connection seconds after a file
+    read), so one episode can have several records; the last is the whole episode."""
+    return list({r["episode"]["episode_id"]: r for r in records}.values())
+
+
 def check(name, ok, evidence=None):
     checks.append({"name": name, "status": "PASS" if ok else "FAIL", "evidence": evidence})
 
@@ -58,7 +64,8 @@ check("Falco alerts carry pod and namespace for the test pods (from the k3s cont
       want <= seen, {"alerts": len(alerts), "pods_seen": sorted(f"{ns}/{p}" for ns, p in seen if ns and ns != "<NA>")})
 
 # --- episodes (no model) -----------------------------------------------------------------------
-episodes = read_jsonl(results / "episodes-none.jsonl")
+records = read_jsonl(results / "episodes-none.jsonl")   # every assessment, for "never matches"
+episodes = latest(records)
 web = web_episode(episodes, "dnom-test")
 w = web[0]["episode"] if len(web) == 1 else {}
 check("web pod (dnom-test) is one episode, labelled with pod, namespace and image",
@@ -88,23 +95,47 @@ check("every container episode names its pod and namespace (none left with only 
 scoped = "k8s-test-namespace-credentials"
 check("namespace-scoped rule matches the web pod and the exec in dnom-test",
       len(web) == 1 and len(execd) == 1 and scoped in rules(web[0]) and scoped in rules(execd[0]))
+other_all = web_episode(records, "dnom-other")
 check("namespace-scoped rule does not match the same activity in dnom-other",
-      len(other) == 1 and scoped not in rules(other[0]), sorted(rules(other[0])) if other else None)
+      other_all and not any(scoped in rules(r) for r in other_all), [sorted(rules(r)) for r in other_all])
 # The baseline is per node: whichever web pod connects first makes 203.0.113.7 known, so the
 # model-free rule matches that pod only.
 first = [r for r in web + other if any(n["dest"] == "203.0.113.7:80" and n["new_destination"] for n in r["episode"]["network"])]
 check("destination baseline is per node: only the first web pod's connection counts as new",
       len(web) == 1 and len(other) == 1 and len(first) == 1 and "credentials-then-new-destination" in rules(first[0]),
       [r["episode"]["container"]["namespace"] for r in first])
-host = [r for r in episodes if "container" not in r["episode"] and scoped in rules(r)]
+host = [r for r in records if "container" not in r["episode"] and scoped in rules(r)]
 check("namespace-scoped rule matches no host episode", not host, [r["episode"]["root"]["argv"] for r in host][:3])
-all_policy = [p for r in episodes for p in r["policy"]]
+
+# --- decoy addresses: one list covers every pod on the node -------------------------------------
+probes = [r for r in episodes if in_pod(r, "probe", "dnom-test")]
+hits = sorted({d for r in probes for d in r["episode"].get("decoy_destinations", [])})
+check("a pod's connection attempt to a decoy address matches decoy-contacted, labelled with the pod",
+      "198.51.100.77:5432" in hits and any("decoy-contacted" in rules(r) for r in probes), hits)
+check("a pod's ping to a decoy address is seen", any(h.startswith("198.51.100.78:") for h in hits), hits)
+others = [r["episode"]["root"]["argv"][:60] for r in records if r["episode"].get("decoy_destinations") and not in_pod(r, "probe", "dnom-test")]
+check("no other pod or host episode reached a decoy address", not others, others[:3])
+
+# --- image unpacking (regression: it matched credentials-then-new-destination) -----------------
+STORAGE = "/var/lib/rancher/k3s/agent/containerd/"
+unpacked = sorted({f["fd.name"] for f in fields
+                   if str(f.get("fd.name", "")).startswith(STORAGE) and f["fd.name"].endswith(("/etc/shadow", "/etc/profile"))
+                   and f.get("evt.is_open_write") in (True, "true")})
+check("containerd unpacked a fresh image while Falco watched (wrote its /etc/shadow and /etc/profile)",
+      any(u.endswith("/etc/shadow") for u in unpacked) and any(u.endswith("/etc/profile") for u in unpacked), unpacked[:4])
+tagged = [(cat, p) for r in records for cat in ("credentials", "persistence")
+          for p in r["episode"]["files"].get(cat, []) if p.startswith(STORAGE)]
+check("image unpacking gets no credentials or persistence category", not tagged, tagged[:3])
+host_free = [r for r in records if "container" not in r["episode"] and "credentials-then-new-destination" in rules(r)]
+check("model-free rule matches no host episode (the image pull no longer does)", not host_free,
+      [r["episode"]["root"] for r in host_free][:3])
+all_policy = [p for r in records for p in r["policy"]]
 check("every reported action is dry run", all(p["dry_run"] for p in all_policy), {"matches": len(all_policy)})
 
 # --- Jev ---------------------------------------------------------------------------------------
 jev_file = results / "episodes-jev.jsonl"
 if jev_file.exists():
-    jev = web_episode(read_jsonl(jev_file), "dnom-test")
+    jev = web_episode(latest(read_jsonl(jev_file)), "dnom-test")
     a = jev[0].get("answers", {}) if jev else {}
     check("Jev assessed the web pod episode (pod context included)", bool(a),
           {"credential_access": a.get("credential_access", {}).get("noul"),

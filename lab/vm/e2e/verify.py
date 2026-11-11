@@ -20,6 +20,12 @@ def read_jsonl(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def latest(records):
+    """classify reassesses an episode when it changes, so one episode can have several
+    records; the last is the whole episode."""
+    return list({r["episode"]["episode_id"]: r for r in records}.values())
+
+
 def check(name, ok, evidence=None):
     checks.append({"name": name, "status": "PASS" if ok else "FAIL", "evidence": evidence})
 
@@ -114,7 +120,8 @@ check("IPv6 connect() captured",
       any(e["kind"] == "net" and e["op"] == "connect" and e["dest"] == v6 and e["pid"] == sc["pid"] for e in events), v6)
 
 # --- round 1: episodes and policies (no model) --------------------------------------------------
-episodes = read_jsonl(results / "episodes-none.jsonl")
+records = read_jsonl(results / "episodes-none.jsonl")
+episodes = latest(records)
 sim = [r for r in episodes if r["episode"]["root"]["argv"].endswith("/fake-exfil.sh")]
 check("simulation is one process-tree episode",
       len(sim) == 1 and {"cat", "base64", "curl"} <= {Path(p.get("exe", "")).name for p in sim[0]["episode"]["tree"]},
@@ -124,35 +131,118 @@ check("model-free rule matches the simulation",
 benign = [r for r in episodes if r["episode"]["root"]["argv"].endswith("/benign.sh")]
 loopback = f"127.0.0.1:{benign_info['loopback_port']}"
 check("benign workload: loopback recorded, not new, no rule matches",
-      len(benign) == 1 and not benign[0]["policy"]
+      len(benign) == 1 and not any(r["policy"] for r in records if r["episode"]["root"]["argv"].endswith("/benign.sh"))
       and any(n["dest"] == loopback and not n["new_destination"] for n in benign[0]["episode"]["network"]),
       loopback)
-all_policy = [p for r in episodes for p in r["policy"]]
+all_policy = [p for r in records for p in r["policy"]]
 check("every reported action is dry run", all(p["dry_run"] for p in all_policy), {"matches": len(all_policy)})
+
+# --- round 1: decoy file -----------------------------------------------------------------------
+decoy_path = f"{vmdir}/decoy/backup-credentials.txt"
+touched = [r for r in episodes if "decoy-touched" in {p["rule"] for p in r["policy"]}]
+dec = touched[0] if touched else None
+check("reading the decoy file matches decoy-touched, and nothing else would have caught it",
+      len(touched) == 1 and dec["episode"]["files"].get("decoys") == [decoy_path]
+      and "credentials" not in dec["episode"]["files"] and {p["rule"] for p in dec["policy"]} == {"decoy-touched"},
+      {"episodes": [r["episode"]["root"]["argv"] for r in touched], "files": dec["episode"]["files"] if dec else None})
+
+# --- round 1: decoy addresses (probe.sh) -------------------------------------------------------
+probes = [r for r in episodes if r["episode"]["root"]["argv"].endswith("/probe.sh")]
+probe = probes[0] if len(probes) == 1 else {"episode": {}, "policy": []}
+hits = probe["episode"].get("decoy_destinations", [])
+check("decoy addresses: a refused port on this machine and an unused address match decoy-contacted",
+      len(probes) == 1 and "127.0.0.1:6379" in hits and "198.51.100.77:22" in hits
+      and "decoy-contacted" in {p["rule"] for p in probe["policy"]}, hits)
+check("decoy addresses: a ping to a decoy address is seen",
+      any(h.startswith("198.51.100.78:") for h in hits), hits)
+check("decoy addresses: another port on this machine is recorded and is not a decoy",
+      any(n["dest"] == "127.0.0.1:6380" for n in probe["episode"].get("network", [])) and "127.0.0.1:6380" not in hits,
+      [n["dest"] for n in probe["episode"].get("network", [])])
+others = [r["episode"]["root"]["argv"] for r in records
+          if r["episode"].get("decoy_destinations") and not r["episode"]["root"]["argv"].endswith("/probe.sh")]
+check("decoy addresses: no other episode reached one", not others, others[:3])
+
+# --- round 1: audit trail, `dnom audit`, `dnom monitor` ----------------------------------------
+sim_ep = sim[0]["episode"] if len(sim) == 1 else {"tree": [], "trail": []}
+root_pid = sim_ep["tree"][0]["pid"] if sim_ep["tree"] else None
+pids = {n["pid"]: n for n in sim_ep["tree"] if "pid" in n}
+by = lambda step: Path(pids.get(step["pid"], {}).get("exe", "")).name
+steps = [(by(t), t["event"], t.get("path", t.get("dest", ""))) for t in sim_ep.get("trail", [])]
+check("audit trail: the simulation's steps name the process that did each one, in order",
+      any(st[0] == "cat" and st[1] == "open" and st[2].endswith("/.ssh/id_ed25519") for st in steps)
+      and ("curl", "net", "203.0.113.7:443") in steps
+      and [t["ts_ms"] for t in sim_ep["trail"]] == sorted(t["ts_ms"] for t in sim_ep["trail"])
+      # Every process but the root has its parent in the tree (the root's parent is sshd).
+      and all(n.get("ppid") in pids for n in sim_ep["tree"] if n.get("pid") not in (None, root_pid)),
+      steps[:6])
+threat_ids = {r["episode"]["episode_id"] for r in records if r["policy"]}
+audit_list = (results / "audit-list.txt").read_text()
+audit_decoy = (results / "audit-decoy.txt").read_text()
+check("`dnom audit` lists the matched episodes and shows the decoy episode with its tree",
+      threat_ids and all(f"{i}  THREAT" in re.sub(r" +", "  ", audit_list) for i in threat_ids)
+      and "THREAT · 1 rule matched (dry run)" in audit_decoy and "[DECOY]" in audit_decoy
+      and f"read {decoy_path}" in audit_decoy and "What happened" in audit_decoy,
+      audit_decoy.splitlines()[:12])
+monitor = (results / "monitor.txt").read_text()
+reported = set(re.findall(r"^(ep-\d+-[0-9a-f]+)  THREAT", monitor, re.M))
+check("`dnom monitor` reported every matched episode live, and only those",
+      threat_ids and reported == threat_ids, {"reported": sorted(reported), "expected": sorted(threat_ids)})
 
 # --- round 1: Jev ------------------------------------------------------------------------------
 jev_file, jev_benign_file = results / "episodes-jev.jsonl", results / "episodes-jev-benign.jsonl"
 if jev_file.exists() and jev_benign_file.exists():
-    jev = read_jsonl(jev_file)
+    jev = latest(read_jsonl(jev_file))
     expected = {"credentials-then-new-destination", "credential-theft", "exfiltration", "persistence"}
     got = {p["rule"] for r in jev for p in r["policy"]}
     check("Jev: simulation matches the four expected rules", len(jev) == 1 and expected <= got,
           {"rules": sorted(got), "latency_ms": [r.get("latency_ms") for r in jev]})
-    jb = read_jsonl(jev_benign_file)
+    audit_jev = (results / "audit-jev.txt").read_text()
+    check("`dnom audit` shows the model's answers for the simulation",
+          "credential_access" in audit_jev and "█" in audit_jev and "fake-exfil.sh" in audit_jev,
+          [line for line in audit_jev.splitlines() if "credential_access" in line or "jev" in line][:3])
+    jb_all = read_jsonl(jev_benign_file)
+    jb = latest(jb_all)
     # Only "no rule matches" is asserted: Jev's response choice for benign activity can be a
     # near tie (ignore 0.44 vs watch 0.43 in one run), so asserting it would be flaky.
-    check("Jev: benign workload matches no rule", len(jb) == 1 and not jb[0]["policy"],
+    check("Jev: benign workload matches no rule", len(jb) == 1 and not any(r["policy"] for r in jb_all),
           {"response": jb[0]["answers"]["response"]["probabilities"] if jb else None,
            "latency_ms": [r.get("latency_ms") for r in jb]})
 else:
     skip("Jev: simulation matches the four expected rules", "Jev not run (no key or E2E_JEV=0)")
     skip("Jev: benign workload matches no rule", "Jev not run (no key or E2E_JEV=0)")
+    skip("`dnom audit` shows the model's answers for the simulation", "Jev not run (no key or E2E_JEV=0)")
 
 # --- replays inside the VM ---------------------------------------------------------------------
 for fx in ("exfil", "lateral"):
     recs = read_jsonl(results / f"replay-{fx}.jsonl")
     check(f"replay fake-{fx} (synthetic) matches the model-free rule",
           any(p["rule"] == "credentials-then-new-destination" for r in recs for p in r["policy"]))
+
+# --- live run inside the VM: generated decoys ---------------------------------------------------
+live_log = (results / "live-classify.log").read_text()
+try:
+    planted = json.loads((results / "live-decoys.json").read_text())["files"]
+except (ValueError, KeyError):
+    planted = []
+check("live: one decoy generated per kind, in the lab user's home",
+      [f["kind"] for f in planted] == ["ssh", "aws", "env"] and "decoys planted: 3 (ssh, aws, env)" in live_log
+      and all(f["path"].startswith("/home/lab/") for f in planted),
+      [f["path"] for f in planted])
+live = latest(read_jsonl(results / "live-episodes.jsonl"))
+rules_of = lambda r: {p["rule"] for p in r["policy"]}
+# Episodes show the home folder as ~.
+short = lambda path: path.replace("/home/lab/", "~/", 1)
+touched = sorted([r["episode"]["root"]["argv"], r["episode"]["files"].get("decoys", [])] for r in live if "decoy-touched" in rules_of(r))
+check("live: reading each generated decoy matches decoy-touched, and nothing else touched one",
+      planted and touched == sorted([f"cat {short(f['path'])}", [short(f["path"])]] for f in planted), touched)
+list_path = f"{vmdir}/live/state/decoys.json"
+readers = [r["episode"]["root"]["argv"] for r in live if r["episode"]["files"].get("dnom_config") == [list_path] and "config-touched" in rules_of(r)]
+check("live: reading dnom's list of decoys is reported (config-touched)", readers == [f"cat {list_path}"], readers)
+leftovers = (results / "live-leftovers.txt").read_text().split()
+check("live: after dnom stops, every generated file and the list are gone, and the home folder is as before",
+      planted and not leftovers and "removed 3 generated decoys" in live_log
+      and (results / "live-home-before.txt").read_text() == (results / "live-home-after.txt").read_text(),
+      {"leftovers": leftovers, "log": [line for line in live_log.splitlines() if "decoys" in line]})
 
 # --- report ------------------------------------------------------------------------------------
 counts = collections.Counter(c["status"] for c in checks)

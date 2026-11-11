@@ -4,6 +4,8 @@
 # web (dnom-test)   reads /etc/shadow, tries 203.0.113.7, exits
 # web (dnom-other)  the same, in another namespace: a rule scoped to dnom-test must not match
 # db  (dnom-test)   stays up; run.sh `kubectl exec`s into it
+# probe (dnom-test) tries two decoy addresses in TEST-NET-2 (198.51.100.0/24, never routed):
+#                   one on a database port, one with ping
 apiVersion: v1
 kind: Namespace
 metadata: {name: dnom-test}
@@ -46,3 +48,15 @@ spec:
       image: alpine:3.20
       imagePullPolicy: IfNotPresent
       command: [sleep, "600"]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: probe, namespace: dnom-test}
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: probe
+      image: alpine:3.20
+      imagePullPolicy: IfNotPresent
+      command: [sh, -c, "wget -q -T 1 -O /dev/null http://198.51.100.77:5432/ || true; ping -c 1 -W 1 198.51.100.78 || true"]

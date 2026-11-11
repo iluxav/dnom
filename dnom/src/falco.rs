@@ -188,6 +188,16 @@ mod tests {
         ))
         .unwrap();
         assert!(matches!(&evs[0].data, Data::Net { op, dest } if op == "connect" && dest == "203.0.113.7:80"));
+        // Shape from Falco 0.45: busybox ping in a pod (raw socket; port 0, as ICMP has none).
+        let evs = parse_line(&line(
+            "dnom_connect",
+            serde_json::json!({
+                "evt.rawtime": 1u64, "proc.pid": 9, "thread.tid": 9, "user.uid": 0, "proc.name": "ping",
+                "evt.type": "sendto", "fd.sip": "198.51.100.78", "fd.sport": 0, "evt.arg.addr": null,
+            }),
+        ))
+        .unwrap();
+        assert!(matches!(&evs[0].data, Data::Net { op, dest } if op == "sendto" && dest == "198.51.100.78:0"));
         for (addr, want) in [("::1:8080", Some("[::1]:8080")), ("[::1]:8080", Some("[::1]:8080")),
                              ("/run/x.sock", None), ("<NA>", None), ("", None)] {
             assert_eq!(dest_from_addr(addr).as_deref(), want, "{addr}");

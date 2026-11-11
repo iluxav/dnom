@@ -14,6 +14,7 @@ DIR=${1:?usage: guest.sh DIR run|stop}
 K3S_VERSION=${K3S_VERSION:-v1.37.2+k3s1}
 NODE=dnom-lab
 OUT=$DIR/out
+UNPACK_IMAGE=dnom-unpack:test   # built and removed by each run
 
 say() { printf 'guest: %s\n' "$*" >&2; }
 kc() { sudo k3s kubectl "$@"; }
@@ -66,6 +67,22 @@ run() {
   for _ in $(seq 60); do kc -n dnom-falco logs ds/falco 2>/dev/null | grep -q 'Opening' && break; sleep 1; done
   sleep 8   # let the rules load and the container plugin connect to containerd
 
+  # Image unpacking (lab/notes/kubernetes.md, finding 5): containerd writes each image's
+  # /etc/shadow and /etc/profile into its storage, which must not count as credential access
+  # or persistence. A one-layer image, unique per run, so its layer is always unpacked anew
+  # (a pulled image can share layers that are already on disk).
+  say "importing a fresh one-layer image"
+  local root
+  root=$(mktemp -d)
+  mkdir -p "$root/etc"
+  printf 'root:*:20000:0:99999:7:::\n' > "$root/etc/shadow"
+  printf 'export DNOM_LAB=1\n' > "$root/etc/profile"
+  date +%s%N > "$root/dnom-stamp"
+  tar -C "$root" -cf - . | sudo docker import - $UNPACK_IMAGE >/dev/null
+  rm -rf "$root"
+  sudo docker save $UNPACK_IMAGE | sudo k3s ctr -n k8s.io images import - >/dev/null
+  sleep 2
+
   say "test pods"
   kc apply -f "$DIR/workload.yaml" >/dev/null
   kc -n dnom-test wait --for=condition=Ready pod/db --timeout=120s >/dev/null
@@ -74,6 +91,7 @@ run() {
   for ns in dnom-test dnom-other; do
     kc -n $ns wait --for=jsonpath='{.status.phase}'=Succeeded pod/web --timeout=120s >/dev/null
   done
+  kc -n dnom-test wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe --timeout=120s >/dev/null
   sleep 3
   kc get pods -A -o json > "$OUT/pods.json"
   kc -n dnom-falco logs ds/falco > "$OUT/falco.log" 2>&1 || true
@@ -88,8 +106,10 @@ stop() {
     say "deleting the test namespaces and Falco"
     # Falco exits on SIGTERM and closes its output file.
     kc delete namespace dnom-test dnom-other dnom-falco --ignore-not-found --timeout=90s >/dev/null || true
+    sudo k3s ctr -n k8s.io images rm --sync "docker.io/library/$UNPACK_IMAGE" >/dev/null 2>&1 || true
     sudo systemctl stop dnom-k3s
   fi
+  sudo docker rmi $UNPACK_IMAGE >/dev/null 2>&1 || true
 }
 
 case ${2:-} in

@@ -42,12 +42,56 @@ boundaries:
 # Credential paths ending in .pub are excluded; precedence is credentials, persistence,
 # system_binaries, temp. These classify paths; they do not mask them in outbound data.
 # Kernel noise filters still run first (including /proc); these rules cannot undo them.
+# Writes inside container runtime storage (/var/lib/containerd/, /var/lib/docker/,
+# /var/lib/containers/, k3s's containerd) get no category: that is image unpacking.
+# Reads there keep their category.
 paths:
   include_defaults: true   # false uses only the lists below for all four categories
   credentials: []         # e.g. ["/etc/myapp/session", "/.config/myapp/session"]
   persistence: []         # e.g. ["/etc/myapp/startup/"]
   system_binaries: []     # e.g. ["/opt/myapp/bin/"]
   temp: []                # e.g. ["/scratch/"]
+
+# Decoys: files no program has a reason to open, placed where an intruder would look. Any
+# open of one (read or write) is listed as files.decoys, and the rule decoy-touched below
+# needs no model. The model is not told a file is a decoy, so its answers stay an
+# independent check.
+decoys:
+  # Generated decoys: `dnom classify` plants one file per kind in your home when it starts
+  # (live runs on this machine only; never for --input or --remote-source) and removes them
+  # when it stops. Names are picked at random from believable ones that ssh and the AWS
+  # tools never load themselves; contents are random and can't log in anywhere.
+  # - Never overwrites a file; removes only files it created that are unchanged.
+  # - Killed without a chance to clean up (kill -9, power loss)? The next start removes them.
+  # - The list is kept in the state folder (decoys.json). Another program reading it is
+  #   reported by the rule config-touched, like this file.
+  # - Backup and indexing tools that read everything in these folders will trip them.
+  auto:
+    ssh: true      # a spare-looking private key in ~/.ssh
+    aws: true      # a backup-looking credentials file in ~/.aws
+    env: true      # a .env with fake secrets in your home folder
+  # While dnom runs, replace the generated set after this many days (0: one set per run).
+  rotate_days: 7
+  # Hand-placed decoys: an absolute path, or a folder ending in / for everything under it;
+  # exact matches only. Create the file yourself, readable (a failed open isn't seen), and
+  # away from /proc, /sys and library folders (filtered as noise).
+  # The entry below is an example for this machine, created with
+  #   mkdir -p ~/.local/share/dnom-lab/decoys
+  #   echo DECOY-NOT-A-REAL-CREDENTIAL > ~/.local/share/dnom-lab/decoys/aws-credentials-backup.txt
+  # Real ones go where an intruder would look, e.g. "/srv/backup/db-credentials.txt".
+  paths: ["/home/iluxa/.local/share/dnom-lab/decoys/"]
+  # Decoy addresses: an attempt to connect to one is reported as net.decoys, and the rule
+  # decoy-contacted below needs no model. Only a list: nothing has to listen there and dnom
+  # never connects. One attempt is enough, so a slow scan trips it like a fast one.
+  #   "10.43.0.77"        an unused address in the range your services use: any port counts
+  #   "10.43.0.20:5432"   a real machine, one fake door: only that port counts
+  #   "127.0.0.1:6379"    a fake door on this machine (also "[::1]:6379")
+  # For port entries pick well-known service ports the machine does NOT run, several of
+  # them: 22 SSH, 3306 MySQL, 5432 PostgreSQL, 6379 Redis, 27017 MongoDB, 9200 Elasticsearch,
+  # 3389 remote desktop. Those are the doors a scan tries.
+  # The entries below are an example for this machine, which runs no Redis or MongoDB;
+  # remove one if you start running that service here.
+  addresses: ["127.0.0.1:6379", "127.0.0.1:27017"]
 
 # Mask argument values before storing episodes or sending them to Jev.
 # Name fragments, exact names, flags, and headers are case-insensitive.
@@ -69,8 +113,10 @@ redact:
 # when: comparisons (== != > >= < <=) joined with and / or / not, parentheses allowed.
 #   Fields: question ids (noul/score: number; choice: option name, e.g. response == "alert";
 #   <choice>.<option>: that option's probability), flags ("new_exe" in flags),
-#   files.credentials / files.persistence / files.system_binaries / files.temp (counts),
-#   net.new / net.total (destination counts), procs, uid, and with Falco as the source
+#   files.credentials / files.persistence / files.system_binaries / files.temp /
+#   files.decoys / files.dnom_config (counts),
+#   net.new / net.total / net.decoys (destination counts), procs, uid, and with Falco as
+#   the source
 #   container.name, container.image ("repo:tag", Docker's short form: "alpine:3.20", not
 #   "docker.io/library/alpine:3.20"), k8s.pod, k8s.namespace
 #   (e.g. k8s.namespace == "prod"; these are missing for processes on the host itself).
@@ -83,6 +129,24 @@ policies:
   dry_run: true
   protected: [sshd, sshd-session, systemd, init, dnom, falco]
   rules:
+    # A decoy file (decoys: above) was opened. No model needed, and close to certain.
+    - name: decoy-touched
+      when: files.decoys > 0
+      actions: [alert]
+
+    # Something tried to connect to a decoy address (decoys.addresses). No model needed.
+    - name: decoy-contacted
+      when: net.decoys > 0
+      actions: [alert]
+
+    # A program other than dnom opened this config file or dnom's list of generated decoys:
+    # how an intruder or a rogue agent would learn what to avoid.
+    # Editors, git and search tools count too: keep the live config where nothing else
+    # reads it (~/.config/dnom/dnom.yaml). Off with --remote-source (another machine's files).
+    - name: config-touched
+      when: files.dnom_config > 0
+      actions: [alert]
+
     # No model needed, so it holds even if an attacker manipulates what the model reads.
     - name: credentials-then-new-destination
       when: files.credentials > 0 and net.new > 0

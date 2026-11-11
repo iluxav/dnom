@@ -6,8 +6,8 @@
 # 2. guest.sh installs k3s if missing (pinned version, checksum verified), starts it, deploys
 #    Falco and the pods, collects Falco's alerts, then deletes everything and stops k3s.
 # 3. Classifies the alerts on the host without a model, with a namespace-scoped test rule
-#    (rules.yaml) added to a copy of dnom.yaml; with Jev too if a key is available (only the
-#    two web-pod episodes are sent; the key never enters the VM).
+#    (rules.yaml) and two decoy addresses added to a copy of dnom.yaml; with Jev too if a
+#    key is available (only the two web-pod episodes are sent; the key never enters the VM).
 # 4. verify.py checks that episodes and policies see the pod and namespace, and writes
 #    report.json.
 #
@@ -51,7 +51,9 @@ done
 vm "uname -r" </dev/null > "$R/kernel.txt"
 
 say "classifying on the host"
-sed '/^  rules:$/r lab/vm/k3s/rules.yaml' dnom.yaml > "$R/dnom-k3s.yaml"
+sed -e '/^  rules:$/r lab/vm/k3s/rules.yaml' \
+    -e 's|^  addresses: \[.*|  addresses: ["198.51.100.77", "198.51.100.78"]|' dnom.yaml > "$R/dnom-k3s.yaml"
+grep -q '^  addresses: \["198.51.100.77", "198.51.100.78"\]' "$R/dnom-k3s.yaml" || { say "could not list the decoy addresses"; exit 1; }
 grep -q k8s-test-namespace-credentials "$R/dnom-k3s.yaml" || { say "could not add the test rule"; exit 1; }
 common=(--source falco --remote-source --home /home/lab --input "$R/falco.json" --learn 0 --json
         --config "$R/dnom-k3s.yaml")
