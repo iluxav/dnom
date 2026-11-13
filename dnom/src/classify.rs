@@ -22,6 +22,7 @@ use crate::{
     config,
     decoys::Planted,
     episode::{Baseline, Episode, Tracker},
+    notify::Notifier,
     event::{Data, Event},
     policy::{Match, Policies},
     questions::Question,
@@ -89,6 +90,10 @@ pub struct ClassifyArgs {
     /// Only print episodes a policy rule matched (all assessments are still logged).
     #[arg(long)]
     matches_only: bool,
+    /// Send webhook alerts (`notify:` in dnom.yaml) also when replaying a recording with
+    /// --input. Live runs send them whenever a URL is configured.
+    #[arg(long)]
+    notify: bool,
     /// Directory for baseline.json and assessments.jsonl (default ~/.local/state/dnom).
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -139,6 +144,11 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     // tripwire like the config.
     let live_here = args.input.is_none() && !args.remote_source;
     let decoy_config = config.decoys.clone();
+    // A replayed recording is old news: it alerts only when asked to.
+    let mut notifier = match args.input.is_none() || args.notify {
+        true => Notifier::from_config(&config.notify, args.remote_source)?,
+        false => None,
+    };
     if live_here {
         let list = Planted::state_path(&state_dir);
         config.paths.own_config.push(std::path::absolute(&list).unwrap_or(list).to_string_lossy().into_owned());
@@ -245,7 +255,11 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         }
         let due = *next_tick.get_or_insert(now_ms + interval_ms);
         if now_ms >= due || ended {
-            assessed_total += tick(&mut tracker, &args, backend.as_deref(), &assessment.questions, &policies, &mut log, now_ms, ended)?;
+            assessed_total +=
+                tick(&mut tracker, &args, backend.as_deref(), &assessment.questions, &policies, &mut log, notifier.as_mut(), now_ms, ended)?;
+            if let Some(n) = &mut notifier {
+                n.flush();
+            }
             next_tick = Some(now_ms + interval_ms);
         }
         if !replay && last_status.elapsed() >= Duration::from_secs(15) {
@@ -268,6 +282,12 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
         }
     }
     drop(planted);
+    if let Some(n) = &mut notifier {
+        n.flush();
+        if n.waiting() > 0 {
+            eprintln!("dnom classify: {} alerts were not delivered (they are in the log: dnom audit --threats)", n.waiting());
+        }
+    }
     tracker.baseline.save(&baseline_path)?;
     let (exes, dests) = tracker.baseline.len();
     eprintln!(
@@ -359,6 +379,7 @@ fn tick(
     questions: &[Question],
     policies: &Policies,
     log: &mut File,
+    mut notifier: Option<&mut Notifier>,
     now_ms: u64,
     final_tick: bool,
 ) -> anyhow::Result<u64> {
@@ -409,10 +430,13 @@ fn tick(
         ep.assessed_version = version;
         ep.first_unassessed_ms = None;
         let matches = policies.evaluate(&episode_json, result.as_ref().map(|(_, a, _)| &a.answers));
-        if !args.matches_only || !matches.is_empty() {
-            report(ep, &episode_json, result.as_ref(), questions, &matches, args.json, log)?;
+        let record = if !args.matches_only || !matches.is_empty() {
+            report(ep, &episode_json, result.as_ref(), questions, &matches, args.json, log)?
         } else {
-            log_record(ep, &episode_json, result.as_ref(), &matches, log)?;
+            log_record(ep, &episode_json, result.as_ref(), &matches, log)?
+        };
+        if let Some(n) = notifier.as_deref_mut() {
+            n.offer(&record);
         }
         assessed += 1;
     }
@@ -438,13 +462,14 @@ fn report(
     matches: &[Match],
     as_json: bool,
     log: &mut File,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Value> {
     let record = log_record(ep, episode_json, result, matches, log)?;
 
     let mut out = io::stdout().lock();
     if as_json {
         writeln!(out, "{record}")?;
-        return Ok(out.flush()?);
+        out.flush()?;
+        return Ok(record);
     }
     let header = match result {
         Some((backend, a, took)) => format!("[{backend} {} {:.1}s]", a.model, took.as_secs_f64()),
@@ -459,7 +484,8 @@ fn report(
         writeln!(out, "  WOULD: {} → {}{protected}   [{}]", m.rule, actions.join(", "), values.join(" "))?;
     }
     report_body(episode_json, result, questions, &mut out)?;
-    Ok(out.flush()?)
+    out.flush()?;
+    Ok(record)
 }
 
 /// Appends the assessment (with policy matches) to assessments.jsonl and returns it.

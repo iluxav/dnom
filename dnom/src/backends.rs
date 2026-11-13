@@ -239,7 +239,7 @@ fn is_loopback(host: &str) -> bool {
 
 /// Reads `KEY=value` (optionally `export KEY="value"`) from a dotenv file without
 /// touching the process environment.
-fn dotenv_value(path: &str, key: &str) -> Option<String> {
+pub(crate) fn dotenv_value(path: &str, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     text.lines().find_map(|line| {
         let line = line.trim();

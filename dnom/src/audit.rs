@@ -180,7 +180,7 @@ fn id_of(record: &Value) -> &str {
     record["episode_id"].as_str().unwrap_or("?")
 }
 
-fn rules_of(record: &Value) -> Vec<&str> {
+pub(crate) fn rules_of(record: &Value) -> Vec<&str> {
     record["policy"].as_array().into_iter().flatten().filter_map(|p| p["rule"].as_str()).collect()
 }
 
@@ -190,7 +190,7 @@ fn is_threat(record: &Value) -> bool {
 
 /// For `monitor`: the rules this record matched that weren't reported for its episode yet.
 /// None when there is nothing new to report (no match, or the same rules as before).
-fn newly_matched(reported: &mut HashMap<String, BTreeSet<String>>, record: &Value) -> Option<Vec<String>> {
+pub(crate) fn newly_matched(reported: &mut HashMap<String, BTreeSet<String>>, record: &Value) -> Option<Vec<String>> {
     let seen = reported.entry(id_of(record).to_string()).or_default();
     let new: Vec<String> = rules_of(record).into_iter().filter(|r| seen.insert(r.to_string())).map(String::from).collect();
     (!new.is_empty()).then_some(new)
@@ -631,6 +631,11 @@ pub struct Paint {
 impl Paint {
     fn auto() -> Self {
         Self { on: io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() }
+    }
+
+    /// No colour: for text that goes into a file or a message.
+    pub fn plain() -> Self {
+        Self { on: false }
     }
 
     fn wrap(&self, code: &str, s: &str) -> String {

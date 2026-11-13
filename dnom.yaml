@@ -170,6 +170,27 @@ policies:
       when: response == "contain"
       actions: [alert]
 
+# Webhook alerts: every episode a policy rule matched is POSTed as JSON to one URL, for
+# whatever turns alerts into messages (a chat bot, an incident tool). Off while url is empty.
+# dnom only notifies; what the receiver does with an alert is its business.
+# - One alert when a rule first matches an episode; another ("event": "threat_update") only
+#   if the episode later matches further rules.
+# - Live runs only. Add --notify to send while replaying a recording (make notify-test).
+# - A failed send is retried a few times. The alert is in the log either way (dnom audit).
+# - Fields: event, ts, host, episode_id, summary, rules, new_rules, actions (what the rules
+#   WOULD do; dnom is dry run), command, exe, uid, pid, started, ended, pod, namespace,
+#   container, image, answers, report (the `dnom audit` text), episode (everything).
+# - Command lines and file names come from the reported process: a receiver must treat
+#   them as untrusted text (no markup, no shell).
+# Try it: `make notify-listen` in one terminal, set url to http://127.0.0.1:8787/events/dnom_threat
+# and DNOM_NOTIFY_TOKEN=try-me in .env, then `make run`.
+notify:
+  url: ""                        # e.g. http://127.0.0.1:8787/events/dnom_threat
+  token_env: DNOM_NOTIFY_TOKEN   # NAME of the environment variable (or .env entry) holding the
+                                 # shared token, sent as "Authorization: Bearer <token>"
+  name: ""                       # what to call this machine in alerts (default: its hostname)
+  timeout_ms: 3000
+
 # Model backends. `classify --backend <name>` picks one; without it, `backend:` below.
 # `none` is built in: build episodes and print them without asking a model.
 #   type          systemone  Jev's System One API (POST <url>/v1/systemone), also spoken by

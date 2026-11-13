@@ -8,6 +8,7 @@ mod decoys;
 mod episode;
 mod event;
 mod falco;
+mod notify;
 mod paths;
 mod policy;
 mod questions;

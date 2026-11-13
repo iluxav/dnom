@@ -14,6 +14,9 @@ pub struct Config {
     /// Decoy files: hand-placed paths and the kinds dnom generates itself.
     #[serde(default)]
     pub decoys: crate::decoys::DecoyConfig,
+    /// Webhook for episodes a policy rule matched.
+    #[serde(default)]
+    pub notify: crate::notify::NotifyConfig,
     #[serde(default)]
     pub redact: crate::redact::RedactRules,
     /// Context and typed questions sent with each episode; missing parts use the built-ins.
@@ -41,6 +44,7 @@ impl Default for Config {
         Self {
             paths: Default::default(),
             decoys: Default::default(),
+            notify: Default::default(),
             redact: Default::default(),
             assessment: Default::default(),
             policies: Default::default(),
@@ -140,6 +144,7 @@ pub fn load(path: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)> {
             .with_context(|| format!("parse {}", candidate.display()))?;
         config.paths.decoys = config.decoys.paths.clone();
         config.decoys.validate().with_context(|| format!("{}", candidate.display()))?;
+        config.notify.validate().with_context(|| format!("{}", candidate.display()))?;
         config
             .paths
             .validate()

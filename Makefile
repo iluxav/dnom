@@ -58,7 +58,7 @@ endif
 FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 
 .DEFAULT_GOAL := help
-.PHONY: help build test fmt run monitor audit collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
+.PHONY: help build test fmt run monitor audit notify-listen notify-test collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
         vm-push vm-run vm-fake-exfil vm-e2e vm-k3s \
         replay replay-dry bench log jev-check reset-baseline clean
@@ -88,6 +88,12 @@ monitor: build ## Live threat reports only, in a 2nd terminal next to `make run`
 
 audit: build ## Audit trail: assessed episodes; one in full with EP=<episode id or "last">
 	$(BIN) audit $(EP) $(if $(strip $(THREATS)),--threats)
+
+notify-listen: ## Webhook alerts: local listener on 127.0.0.1:8787, token try-me (see notify: in dnom.yaml)
+	python3 -I lab/notify/listener.py --port 8787 --token try-me
+
+notify-test: build ## Webhook alerts: replay the simulation against a local listener (no sudo, ~5 s)
+	lab/notify/test.sh
 
 collect: build ## Live: raw JSON events
 	sudo $(BIN) collect
