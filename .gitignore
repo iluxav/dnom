@@ -2,7 +2,7 @@
 
 # Secrets
 .env
-
+SPEC.md
 # Raw recordings of real host activity (make record)
 /lab/recordings/
 
@@ -11,3 +11,6 @@
 
 # Python bytecode
 __pycache__/
+
+# Working spec, kept local
+SPEC.md
