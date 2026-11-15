@@ -194,6 +194,29 @@ impl Policies {
     }
 }
 
+/// One condition in the policy language, to try on episodes that are already in the log:
+/// `dnom dash` filters with it, so a rule can be tested before it goes into dnom.yaml.
+#[derive(Debug)]
+pub struct Condition(Expr);
+
+impl Condition {
+    pub fn parse(text: &str, assessment: &AssessmentConfig) -> anyhow::Result<Self> {
+        let expr = parse(text)?;
+        FieldTypes::new(assessment).check(&expr)?;
+        Ok(Self(expr))
+    }
+
+    /// Whether it holds for a stored episode and the answers stored with it.
+    pub fn holds(&self, episode: &Value, answers: Option<&BTreeMap<String, Answer>>) -> bool {
+        self.0.eval(&Ctx { episode, answers }) == Some(true)
+    }
+
+    /// Every field a condition can use, for the hint next to the input.
+    pub fn fields(assessment: &AssessmentConfig) -> Vec<String> {
+        FieldTypes::new(assessment).0.into_keys().collect()
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Condition language
 // ---------------------------------------------------------------------------------------------

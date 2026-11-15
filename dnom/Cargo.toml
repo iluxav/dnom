@@ -12,10 +12,12 @@ aya = { workspace = true }
 clap = { workspace = true }
 humantime = { workspace = true }
 libc = { workspace = true }
+ratatui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "net", "signal", "time"] }
 ureq = { workspace = true }
+unicode-width = { workspace = true }
 serde-saphyr = { workspace = true }
 
 [build-dependencies]

@@ -118,7 +118,7 @@ pub fn monitor(args: MonitorArgs) -> anyhow::Result<()> {
     }
 }
 
-fn log_path(state_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+pub(crate) fn log_path(state_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     let dir = match state_dir {
         Some(d) => d.to_path_buf(),
         None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".local/state/dnom"),
@@ -128,21 +128,29 @@ fn log_path(state_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
 
 /// Reads the log from where it stopped last time. Keeps a partly written last line for the
 /// next call, and starts over if the file was truncated.
-struct Tail {
+pub(crate) struct Tail {
     path: PathBuf,
     pos: u64,
     pending: Vec<u8>,
 }
 
 impl Tail {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, pos: 0, pending: Vec::new() }
     }
 
     fn read_new(&mut self) -> anyhow::Result<Vec<Value>> {
+        let mut records = Vec::new();
+        self.each_new(|record| records.push(record))?;
+        Ok(records)
+    }
+
+    /// Hands over each new record as it is read, so a long log is never in memory at once.
+    /// Returns false when the log does not exist (yet).
+    pub(crate) fn each_new(&mut self, mut record: impl FnMut(Value)) -> anyhow::Result<bool> {
         let mut file = match File::open(&self.path) {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e).with_context(|| format!("open {}", self.path.display())),
         };
         if file.metadata()?.len() < self.pos {
@@ -150,20 +158,26 @@ impl Tail {
             self.pending.clear();
         }
         file.seek(SeekFrom::Start(self.pos))?;
-        let mut fresh = Vec::new();
-        self.pos += file.read_to_end(&mut fresh)? as u64;
-        self.pending.extend(fresh);
-
-        let mut records = Vec::new();
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            if let Ok(v) = serde_json::from_slice::<Value>(&line)
-                && v["episode_id"].is_string()
-            {
-                records.push(v);
+        let mut chunk = vec![0u8; 256 * 1024];
+        loop {
+            let n = file.read(&mut chunk)?;
+            if n == 0 {
+                return Ok(true);
             }
+            self.pos += n as u64;
+            self.pending.extend_from_slice(&chunk[..n]);
+            let mut start = 0;
+            while let Some(len) = self.pending[start..].iter().position(|b| *b == b'\n') {
+                let line = &self.pending[start..start + len];
+                if let Ok(v) = serde_json::from_slice::<Value>(line)
+                    && v["episode_id"].is_string()
+                {
+                    record(v);
+                }
+                start += len + 1;
+            }
+            self.pending.drain(..start);
         }
-        Ok(records)
     }
 }
 
@@ -176,7 +190,7 @@ fn latest(records: Vec<Value>) -> Vec<Value> {
     records.into_iter().enumerate().filter(|(i, r)| last_at[id_of(r)] == *i).map(|(_, r)| r).collect()
 }
 
-fn id_of(record: &Value) -> &str {
+pub(crate) fn id_of(record: &Value) -> &str {
     record["episode_id"].as_str().unwrap_or("?")
 }
 
@@ -346,6 +360,28 @@ pub fn render(record: &Value, paint: &Paint) -> String {
     o
 }
 
+/// One line of an episode's outline: the process tree, with what each process did and the
+/// processes it started in time order. `dnom audit` prints it, `dnom dash` paints it.
+pub(crate) struct OutlineLine<'a> {
+    pub ts: Option<u64>,
+    /// Tree drawing in front of the text (`│  ├─ `).
+    pub lead: String,
+    pub what: What<'a>,
+}
+
+pub(crate) enum What<'a> {
+    /// A process, with the first command it ran.
+    Process { command: &'a str, pid: u64 },
+    /// A later command of the process above.
+    Then(&'a str),
+    Step(&'a Value),
+    /// The rest of a long run of similar steps.
+    MoreSteps(usize),
+    /// A step by a process that is not in the tree.
+    Loose(&'a Value),
+    Note(String),
+}
+
 struct Node<'a> {
     /// (time, command line) of each program this process ran, in order.
     ran: Vec<(Option<u64>, &'a str)>,
@@ -357,6 +393,20 @@ struct Node<'a> {
 }
 
 fn render_tree(ep: &Value, paint: &Paint, o: &mut String) {
+    for line in outline(ep) {
+        let (time, lead) = (time_col(line.ts), &line.lead);
+        let _ = match line.what {
+            What::Process { command, pid } => writeln!(o, "  {time}  {lead}{command}  {}", paint.dim(&format!("pid {pid}"))),
+            What::Then(command) => writeln!(o, "  {time}  {lead}↳ then ran: {command}"),
+            What::Step(step) => writeln!(o, "  {time}  {lead}▸ {}", step_text(step, paint)),
+            What::MoreSteps(n) => writeln!(o, "  {time}  {lead}▸ {}", paint.dim(&format!("… {n} more like these"))),
+            What::Loose(step) => writeln!(o, "  {time}  {} {}", step_text(step, paint), paint.dim("(process not in the tree)")),
+            What::Note(text) => writeln!(o, "  {}", paint.dim(&text)),
+        };
+    }
+}
+
+pub(crate) fn outline(ep: &Value) -> Vec<OutlineLine<'_>> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut by_pid: HashMap<u64, usize> = HashMap::new();
     let mut roots: Vec<usize> = Vec::new();
@@ -395,17 +445,19 @@ fn render_tree(ep: &Value, paint: &Paint, o: &mut String) {
         }
     }
 
+    let mut o = Vec::new();
+    let note = |o: &mut Vec<OutlineLine<'_>>, text: String| o.push(OutlineLine { ts: None, lead: String::new(), what: What::Note(text) });
     for &root in &roots {
-        draw(&nodes, root, "", "", paint, o);
+        draw(&nodes, root, "", "", &mut o);
     }
     for step in loose {
-        let _ = writeln!(o, "  {}  {} {}", time_col(step["ts_ms"].as_u64()), step_text(step, paint), paint.dim("(process not in the tree)"));
+        o.push(OutlineLine { ts: step["ts_ms"].as_u64(), lead: String::new(), what: What::Loose(step) });
     }
     if not_shown > 0 {
-        let _ = writeln!(o, "  {}", paint.dim(&format!("… {not_shown} more processes not shown")));
+        note(&mut o, format!("… {not_shown} more processes not shown"));
     }
     if let Some(n) = ep["trail_truncated"].as_u64() {
-        let _ = writeln!(o, "  {}", paint.dim(&format!("… {n} more steps not shown")));
+        note(&mut o, format!("… {n} more steps not shown"));
     }
 
     // Records written before the trail existed: list files and connections without a process.
@@ -416,17 +468,18 @@ fn render_tree(ep: &Value, paint: &Paint, o: &mut String) {
             continue;
         }
         let list: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|f| f.as_str()).collect();
-        let _ = writeln!(o, "  {}", paint.dim(&format!("{category} files: {}", list.join(", "))));
+        note(&mut o, format!("{category} files: {}", list.join(", ")));
     }
     if !has_trail {
         for n in ep["network"].as_array().into_iter().flatten() {
             let new = if n["new_destination"] == true { "  [new destination]" } else { "" };
-            let _ = writeln!(o, "  {}", paint.dim(&format!("connect {} by {}{new}", n["dest"].as_str().unwrap_or("?"), n["by"].as_str().unwrap_or("?"))));
+            note(&mut o, format!("connect {} by {}{new}", n["dest"].as_str().unwrap_or("?"), n["by"].as_str().unwrap_or("?")));
         }
     }
     if let Some(n) = ep["other_file_opens"].as_u64().filter(|n| *n > 0) {
-        let _ = writeln!(o, "  {}", paint.dim(&format!("{n} other file opens (uncategorized, not listed)")));
+        note(&mut o, format!("{n} other file opens (uncategorized, not listed)"));
     }
+    o
 }
 
 /// The most recent process with this program name, for records that only name the parent.
@@ -437,16 +490,16 @@ fn named_parent(nodes: &[Node], name: &str) -> Option<usize> {
     nodes.iter().rposition(|n| n.name == name)
 }
 
-/// Draws a process, then what it did and the processes it started, in time order. `lead` is
-/// printed before this process's own line, `rest` before every line below it.
-fn draw(nodes: &[Node], index: usize, lead: &str, rest: &str, paint: &Paint, o: &mut String) {
+/// Adds a process, then what it did and the processes it started, in time order. `lead` goes
+/// before this process's own line, `rest` before every line below it.
+fn draw<'a>(nodes: &[Node<'a>], index: usize, lead: &str, rest: &str, o: &mut Vec<OutlineLine<'a>>) {
     enum Item<'a> {
         Step(&'a Value),
         Child(usize),
     }
     let node = &nodes[index];
     let (ts, command) = node.ran[0];
-    let _ = writeln!(o, "  {}  {lead}{command}  {}", time_col(ts), paint.dim(&format!("pid {}", node.pid)));
+    o.push(OutlineLine { ts, lead: lead.to_string(), what: What::Process { command, pid: node.pid } });
 
     let mut items: Vec<(Option<u64>, Item)> = node.steps.iter().map(|s| (s["ts_ms"].as_u64(), Item::Step(s))).collect();
     items.extend(node.children.iter().map(|&c| (nodes[c].ran[0].0, Item::Child(c))));
@@ -456,7 +509,7 @@ fn draw(nodes: &[Node], index: usize, lead: &str, rest: &str, paint: &Paint, o: 
 
     let line = if children_after(0) { "│  " } else { "   " };
     for (ts, command) in &node.ran[1..] {
-        let _ = writeln!(o, "  {}  {rest}{line}↳ then ran: {command}", time_col(*ts));
+        o.push(OutlineLine { ts: *ts, lead: format!("{rest}{line}"), what: What::Then(command) });
     }
     let mut i = 0;
     while i < items.len() {
@@ -468,18 +521,17 @@ fn draw(nodes: &[Node], index: usize, lead: &str, rest: &str, paint: &Paint, o: 
                 let line = if children_after(i + run) { "│  " } else { "   " };
                 for (ts, item) in &items[i..i + shown] {
                     if let Item::Step(step) = item {
-                        let _ = writeln!(o, "  {}  {rest}{line}▸ {}", time_col(*ts), step_text(step, paint));
+                        o.push(OutlineLine { ts: *ts, lead: format!("{rest}{line}"), what: What::Step(step) });
                     }
                 }
                 if run > shown {
-                    let note = format!("… {} more like these", run - shown);
-                    let _ = writeln!(o, "  {}  {rest}{line}▸ {}", time_col(items[i + run - 1].0), paint.dim(&note));
+                    o.push(OutlineLine { ts: items[i + run - 1].0, lead: format!("{rest}{line}"), what: What::MoreSteps(run - shown) });
                 }
                 i += run;
             }
             Item::Child(child) => {
                 let (branch, cont) = if children_after(i + 1) { ("├─ ", "│  ") } else { ("└─ ", "   ") };
-                draw(nodes, *child, &format!("{rest}{branch}"), &format!("{rest}{cont}"), paint, o);
+                draw(nodes, *child, &format!("{rest}{branch}"), &format!("{rest}{cont}"), o);
                 i += 1;
             }
         }
@@ -499,34 +551,55 @@ fn step_kind(step: &Value) -> (&str, &str, bool, bool) {
     )
 }
 
-fn step_text(step: &Value, paint: &Paint) -> String {
+/// Why a step stands out.
+pub(crate) enum Tag {
+    Decoy,
+    DnomConfig,
+    /// A sensitive path category: `credentials`, `persistence`, ...
+    Category(String),
+    NewDestination,
+}
+
+/// A step as text (`read ~/.ssh/id_ed25519`) and why it stands out, if it does.
+pub(crate) fn step_parts(step: &Value) -> (String, Option<Tag>) {
     match step["event"].as_str() {
         Some("open") => {
             let verb = if step["write"] == true { "wrote" } else { "read" };
-            let category = step["category"].as_str().unwrap_or("");
-            let tag = match category {
-                "decoys" => paint.red_bold("[DECOY]"),
-                "dnom_config" => paint.red_bold("[DNOM CONFIG]"),
-                other => paint.yellow(&format!("[{other}]")),
+            let tag = match step["category"].as_str().unwrap_or("") {
+                "decoys" => Tag::Decoy,
+                "dnom_config" => Tag::DnomConfig,
+                other => Tag::Category(other.to_string()),
             };
-            format!("{verb} {}  {tag}", step["path"].as_str().unwrap_or("?"))
+            (format!("{verb} {}", step["path"].as_str().unwrap_or("?")), Some(tag))
         }
         Some("net") => {
             let tag = if step["decoy"] == true {
-                format!("  {}", paint.red_bold("[DECOY]"))
+                Some(Tag::Decoy)
             } else if step["new_destination"] == true {
-                format!("  {}", paint.yellow("[new destination]"))
+                Some(Tag::NewDestination)
             } else {
-                String::new()
+                None
             };
             // Port 0: no connection but a ping, or a packet built by the program itself.
             let dest = step["dest"].as_str().unwrap_or("?");
-            match dest.strip_suffix(":0") {
-                Some(ip) => format!("ping or raw packet to {}{tag}", ip.trim_start_matches('[').trim_end_matches(']')),
-                None => format!("connect {dest}{tag}"),
-            }
+            let text = match dest.strip_suffix(":0") {
+                Some(ip) => format!("ping or raw packet to {}", ip.trim_start_matches('[').trim_end_matches(']')),
+                None => format!("connect {dest}"),
+            };
+            (text, tag)
         }
-        _ => step.to_string(),
+        _ => (step.to_string(), None),
+    }
+}
+
+fn step_text(step: &Value, paint: &Paint) -> String {
+    let (text, tag) = step_parts(step);
+    match tag {
+        Some(Tag::Decoy) => format!("{text}  {}", paint.red_bold("[DECOY]")),
+        Some(Tag::DnomConfig) => format!("{text}  {}", paint.red_bold("[DNOM CONFIG]")),
+        Some(Tag::Category(category)) => format!("{text}  {}", paint.yellow(&format!("[{category}]"))),
+        Some(Tag::NewDestination) => format!("{text}  {}", paint.yellow("[new destination]")),
+        None => text,
     }
 }
 
@@ -570,7 +643,7 @@ fn bar(p: f64) -> String {
 }
 
 /// Where the episode ran. Short form for the list: `pod · namespace`.
-fn place(ep: &Value, short: bool) -> String {
+pub(crate) fn place(ep: &Value, short: bool) -> String {
     let Some(c) = ep["container"].as_object() else {
         return if short { "host".into() } else { "this machine (not in a container)".into() };
     };
@@ -590,11 +663,11 @@ fn place(ep: &Value, short: bool) -> String {
 }
 
 /// When the record was written; older dry-run records have no `ts`, so the episode's end.
-fn record_ms(record: &Value) -> Option<u64> {
+pub(crate) fn record_ms(record: &Value) -> Option<u64> {
     rfc3339_ms(&record["ts"]).or_else(|| rfc3339_ms(&record["episode"]["window"]["end"]))
 }
 
-fn rfc3339_ms(v: &Value) -> Option<u64> {
+pub(crate) fn rfc3339_ms(v: &Value) -> Option<u64> {
     let t = humantime::parse_rfc3339(v.as_str()?).ok()?;
     Some(t.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64)
 }
@@ -607,7 +680,7 @@ fn time_col(ms: Option<u64>) -> String {
 }
 
 /// Local time; `format` uses strftime's %Y %m %d %H %M %S.
-fn local(ms: Option<u64>, format: &str) -> String {
+pub(crate) fn local(ms: Option<u64>, format: &str) -> String {
     let Some(ms) = ms else { return "-".into() };
     let secs = (ms / 1000) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -622,7 +695,7 @@ fn local(ms: Option<u64>, format: &str) -> String {
         .replace("%S", &two(tm.tm_sec))
 }
 
-fn span(ms: u64) -> String {
+pub(crate) fn span(ms: u64) -> String {
     match ms / 1000 {
         0 => "under 1 s".into(),
         s if s < 120 => format!("{s} s"),

@@ -4,6 +4,7 @@ mod backends;
 mod classify;
 mod collect;
 mod config;
+mod dash;
 mod decoys;
 mod driver;
 mod episode;
@@ -21,6 +22,7 @@ use clap::{Parser, Subcommand};
 /// dnom: eBPF host monitor PoC.
 ///
 ///   sudo dnom collect | dnom classify     build episodes, ask the model, apply policies
+///   dnom dash                             live dashboard: every assessed episode, with filters
 ///   dnom monitor                          live threat reports (in another terminal)
 ///   dnom audit                            what was assessed; dnom audit <episode> for one
 #[derive(Parser)]
@@ -40,6 +42,8 @@ enum Command {
     Audit(audit::AuditArgs),
     /// (unprivileged) Follow the audit trail live and show only threat reports (matched rules).
     Monitor(audit::MonitorArgs),
+    /// (unprivileged) Live dashboard: the assessed episodes, one in full, and filters over them.
+    Dash(dash::DashArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,5 +56,6 @@ fn main() -> anyhow::Result<()> {
         Command::Classify(args) => classify::run(args),
         Command::Audit(args) => audit::audit(args),
         Command::Monitor(args) => audit::monitor(args),
+        Command::Dash(args) => dash::run(args),
     }
 }

@@ -58,9 +58,9 @@ endif
 FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 
 .DEFAULT_GOAL := help
-.PHONY: help build test fmt run monitor audit notify-listen notify-test collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
+.PHONY: help build test fmt run monitor audit dash notify-listen notify-test collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
-        vm-push vm-run vm-fake-exfil vm-e2e vm-k3s remote-install remote-status remote-pull remote-remove local-start local-status local-report local-stop \
+        vm-push vm-run vm-fake-exfil vm-e2e vm-k3s remote-install remote-status remote-pull remote-remove local-start local-status local-report local-stop local-dash \
         replay replay-dry bench log jev-check reset-baseline clean
 
 help: ## List commands
@@ -88,6 +88,9 @@ monitor: build ## Live threat reports only, in a 2nd terminal next to `make run`
 
 audit: build ## Audit trail: assessed episodes; one in full with EP=<episode id or "last">
 	$(BIN) audit $(EP) $(if $(strip $(THREATS)),--threats)
+
+dash: build ## Live dashboard: assessed episodes, one in full, filters (LOG=<folder with assessments.jsonl>)
+	$(BIN) dash $(if $(strip $(LOG)),--state-dir $(LOG))
 
 notify-listen: ## Webhook alerts: local listener on 127.0.0.1:8787, token try-me (see notify: in dnom.yaml)
 	python3 -I lab/notify/listener.py --port 8787 --token try-me
@@ -203,6 +206,9 @@ local-report: ## This machine: episodes assessed and every rule match of the bac
 
 local-stop: ## This machine: stop the background run (no password; generated decoys are removed)
 	$(LOCAL) stop
+
+local-dash: build ## This machine: the live dashboard on the background run
+	$(BIN) dash --state-dir $(HOME)/.local/state/dnom/trial
 
 kev-serve: ## Start Kev on 127.0.0.1:8009 for --backend kev (KEV_MODEL=..., KEV_GPU=...)
 	cd $(KEV_DIR) && $(if $(strip $(KEV_GPU)),CUDA_VISIBLE_DEVICES=$(KEV_GPU)) \

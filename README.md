@@ -87,6 +87,14 @@ Model
 The first rule matched without the model. The other three used its answers. (Output
 shortened by three lines.)
 
+`dnom dash` shows the same trail live, with filters:
+
+<p align="center">
+  <img alt="dnom dash in a terminal: the list of assessed episodes on the left, the selected episode in full on the right, filters above" src="docs/dashboard.png" width="920">
+</p>
+
+<p align="center"><sub>Sample data: a recorded run of the simulation among made-up everyday episodes.</sub></p>
+
 ## How it works
 
 <picture>
@@ -101,7 +109,7 @@ shortened by three lines.)
 | **Filter** | Only episodes with a signal are assessed: a sensitive file, a new program, a decoy. On a desktop that is typically 0–1 of a few dozen open episodes per 5 s tick. A daemon reading its own files is not a signal ([routine reads](#routine-reads)). | `dnom classify` |
 | **Ask** | Secrets in command lines are masked, then the episode goes to the model with six typed questions. The model is never on the hot path: a slow or offline model delays answers and blocks nothing. | a model backend |
 | **Decide** | Policy rules run over the answers and the facts. Matches are reported as `WOULD: <actions>`. | `dnom classify` |
-| **Report** | Every assessment is logged. `dnom audit` shows it, `dnom monitor` follows threats live, and a webhook can carry them elsewhere. | log, terminal, webhook |
+| **Report** | Every assessment is logged. `dnom dash` shows the log live, `dnom audit` prints it, `dnom monitor` follows threats, and a webhook can carry them elsewhere. | log, terminal, webhook |
 
 Two design choices matter most:
 
@@ -169,13 +177,14 @@ Classify the bundled recording of the simulation, then read the audit trail:
 ```bash
 make replay-dry
 ./target/release/dnom audit last --state-dir /tmp/dnom-replay
+./target/release/dnom dash --state-dir /tmp/dnom-replay    # the same in the dashboard; q quits
 ```
 
 ### 2. Live on your machine, no model
 
 ```bash
 make run BACKEND=none     # terminal 1: asks for sudo (eBPF collector)
-make monitor              # terminal 2: shows only threats
+make dash                 # terminal 2: the live dashboard (or `make monitor`: threats only, as text)
 make fake-exfil           # terminal 3: the harmless simulation
 ```
 
@@ -209,6 +218,7 @@ make run                  # default backend: jev
 ```bash
 make local-start          # asks for your password once
 make local-status         # alive? memory, CPU, episodes assessed
+make local-dash           # the live dashboard on this run
 make local-report         # every episode a rule matched
 make local-stop
 ```
@@ -306,14 +316,46 @@ What happened
 Generated decoys never overwrite a file, and dnom removes only files it created that are
 unchanged. If dnom is killed before it can clean up, the next start removes what was left.
 
-## Audit trail, monitor and alerts
+## Dashboard, audit trail and alerts
 
 ```bash
-dnom audit                 # recent assessed episodes
+dnom dash                  # live dashboard: every assessed episode, one in full, filters
+dnom audit                 # recent assessed episodes, as text
 dnom audit --threats       # only those a rule matched
 dnom audit last            # one episode in full: rules, process tree, steps, model answers
-dnom monitor               # follow live, print only threats (no root, no model)
+dnom monitor               # follow live, print only threats
 ```
+
+All four read the audit trail (`assessments.jsonl`) and nothing else, so they need neither
+root nor a model, and they work on a trail copied from another machine
+(`--state-dir <folder>`).
+
+### The dashboard
+
+The picture under [See it work](#see-it-work) shows it: the episodes on the left, the selected
+one in full on the right, the filters above.
+
+The list follows the log. The selection stays on the newest episode until you move away from
+it; `g` goes back to the newest. Red marks an episode a rule matched, a turning mark one
+whose processes still run on this machine.
+
+| Key | Filter |
+|---|---|
+| `f` | only episodes a rule matched |
+| `1` … `5` | who drives the episode: agent, remote, human, automation, unknown (several can be on) |
+| `t` | time window: 15 minutes, an hour, 24 hours |
+| `/` | words that must all appear: in a command, a path, an address, a rule name |
+| `w` | where: a condition in the [policy language](#policies), such as `driver == "agent" and net.new > 0` |
+| `s` | order: newest first, or highest risk first |
+| `x` | clear all filters |
+
+`w` runs a rule's condition over what is already recorded, so you can see what a new rule
+would have matched before you put it into `dnom.yaml`. `n` and `N` jump between flagged
+episodes, `r` shows the stored record as JSON, `?` lists every key. The mouse selects rows,
+scrolls and toggles filters; `--no-mouse` leaves it to the terminal.
+
+The dashboard only reads. It looks processes up in `/proc` to mark the running ones, and it
+sends them no signal.
 
 **Webhook alerts** are off until you set `notify.url` in `dnom.yaml`. dnom then POSTs one
 JSON alert when a rule first matches an episode, and another only if more rules match later.
@@ -423,7 +465,7 @@ Read these before trusting an alert, or the absence of one.
 
 | Command | What it checks |
 |---|---|
-| `make test` | 77 unit tests |
+| `make test` | 102 unit tests |
 | `make notify-test` | 6 webhook checks against a local listener (no root) |
 | `make vm-e2e` | 45 end-to-end checks in a lab VM: sensors, episodes, policies, decoys, audit, monitor |
 | `make vm-k3s` | 20 checks on k3s with Falco as a DaemonSet: pod labels, namespace-scoped rules, decoy addresses |
@@ -436,7 +478,7 @@ nothing real is read or sent.
 ## Repository layout
 
 ```text
-dnom/              the CLI: collect, classify, audit, monitor
+dnom/              the CLI: collect, classify, audit, monitor, dash
 dnom-ebpf/         the eBPF programs (kernel side)
 dnom-common/       types shared by both
 dnom.yaml          configuration: paths, decoys, policies, backends, questions
