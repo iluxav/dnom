@@ -60,7 +60,7 @@ FIXTURE_ONLY := $(or $(strip $(ONLY)),fake-exfil)
 .DEFAULT_GOAL := help
 .PHONY: help build test fmt run monitor audit notify-listen notify-test collect execs net writes record fake-exfil falco falco-events falco-stats falco-stop kev-serve \
         vm-setup vm-start vm-ssh vm-check vm-stop vm-snapshot vm-reset vm-status vm-destroy \
-        vm-push vm-run vm-fake-exfil vm-e2e vm-k3s \
+        vm-push vm-run vm-fake-exfil vm-e2e vm-k3s remote-install remote-status remote-pull remote-remove local-start local-status local-report local-stop \
         replay replay-dry bench log jev-check reset-baseline clean
 
 help: ## List commands
@@ -172,6 +172,37 @@ vm-status: ## Lab VM: running or not, and its snapshots
 
 vm-destroy: ## Lab VM: delete disk, seed and key (keeps the downloaded image)
 	$(VM) destroy --yes
+
+# --- remote server: only the collector runs there (lab/remote/remote.sh) -------------------
+# HOST is an ssh alias for root or a user with passwordless sudo.
+HOST         ?=
+REMOTE       := BACKEND=$(if $(filter command% environment%,$(origin BACKEND)),$(BACKEND),none) ONLY=$(ONLY) lab/remote/remote.sh
+
+remote-install: build ## Remote server: install the capped collector service (HOST=<ssh alias>)
+	$(REMOTE) install $(HOST)
+
+remote-status: ## Remote server: service state, memory, CPU, event files (HOST=...)
+	$(REMOTE) status $(HOST)
+
+remote-pull: build ## Remote server: copy its events here and classify them (HOST=..., BACKEND=none)
+	$(REMOTE) pull $(HOST)
+
+remote-remove: ## Remote server: stop the collector and delete everything there (HOST=...)
+	$(REMOTE) remove $(HOST)
+
+LOCAL := BACKEND=$(BACKEND) ONLY=$(ONLY) lab/local/local.sh
+
+local-start: build ## This machine: run dnom as a capped background service (asks for your password once)
+	$(LOCAL) start
+
+local-status: ## This machine: is the background run alive, what it uses, how much it assessed
+	$(LOCAL) status
+
+local-report: ## This machine: episodes assessed and every rule match of the background run
+	$(LOCAL) report
+
+local-stop: ## This machine: stop the background run (no password; generated decoys are removed)
+	$(LOCAL) stop
 
 kev-serve: ## Start Kev on 127.0.0.1:8009 for --backend kev (KEV_MODEL=..., KEV_GPU=...)
 	cd $(KEV_DIR) && $(if $(strip $(KEV_GPU)),CUDA_VISIBLE_DEVICES=$(KEV_GPU)) \

@@ -14,3 +14,6 @@ __pycache__/
 
 # Working spec, kept local
 SPEC.md
+
+# Working notes, kept local
+TODO.md

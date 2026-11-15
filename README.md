@@ -55,6 +55,7 @@ ep-4100003-fdac6  THREAT · 4 rules matched (dry run)
   when      2026-11-08 17:32:55 → 17:32:57 (2 s)
   where     this machine (not in a container)
   user      uid 1000, started by bash
+  driver    human (bash in foot)
   command   bash ./scripts/fake-exfil.sh
 
 Rules matched
@@ -96,8 +97,8 @@ shortened by three lines.)
 | Step | What happens | Where |
 |---|---|---|
 | **Sense** | Program starts, successful file opens and outbound connection attempts are recorded. Use dnom's own eBPF collector, or Falco with one extra rules file. | `dnom collect` (root) or Falco |
-| **Group** | Events become episodes, one per process tree. Files are tagged (`credentials`, `persistence`, `system_binaries`, `temp`), and new programs and new destinations are flagged against a learned baseline. | `dnom classify` (no root) |
-| **Filter** | Only episodes with a signal are assessed: a sensitive file, a new program, a decoy. On a desktop that is typically 0–1 of a few dozen open episodes per 5 s tick. | `dnom classify` |
+| **Group** | Events become episodes, one per process tree. Files are tagged (`credentials`, `persistence`, `system_binaries`, `temp`), and new programs and new destinations are flagged against a learned baseline. Each episode is labelled with [who drives it](#who-drives-an-episode). | `dnom classify` (no root) |
+| **Filter** | Only episodes with a signal are assessed: a sensitive file, a new program, a decoy. On a desktop that is typically 0–1 of a few dozen open episodes per 5 s tick. A daemon reading its own files is not a signal ([routine reads](#routine-reads)). | `dnom classify` |
 | **Ask** | Secrets in command lines are masked, then the episode goes to the model with six typed questions. The model is never on the hot path: a slow or offline model delays answers and blocks nothing. | a model backend |
 | **Decide** | Policy rules run over the answers and the facts. Matches are reported as `WOULD: <actions>`. | `dnom classify` |
 | **Report** | Every assessment is logged. `dnom audit` shows it, `dnom monitor` follows threats live, and a webhook can carry them elsewhere. | log, terminal, webhook |
@@ -109,6 +110,45 @@ Two design choices matter most:
 - **Some rules never ask the model.** An attacker controls the command lines and file names
   the model reads, and could try to talk it out of an alert. Decoys and rules such as
   `credentials-then-new-destination` use only facts, so they hold either way.
+
+### Routine reads
+
+`sshd` reads its host keys and `/etc/shadow` for every connection, and cron reads
+`/etc/shadow` for every job. On a server with SSH open to the internet, that was 69 of
+the 73 episodes that would have gone to the model in a 2 h 15 min measurement: 53 SSH
+connections, 44 of them login attempts by strangers, and 16 cron jobs.
+
+dnom treats these as routine: the read stays in the episode's record, but it is not a
+reason to assess the episode. The exemption is narrow:
+
+- It names the program by its full path and the files that belong to it. The same file read
+  by anything else is assessed as before.
+- It never covers a write, a decoy, or a process in a container.
+- It ends when the episode contacts a new destination: credentials followed by a new
+  destination is assessed, whoever read them.
+
+Add your own under `routine.reads` in `dnom.yaml`, for example the deploy key that only
+`/usr/bin/ssh` should read. `routine: {include_defaults: false}` turns the built-in ones off.
+
+### Who drives an episode
+
+Every episode carries a `driver` label, made from the process tree alone:
+
+| Label | Meaning |
+|---|---|
+| `agent` | A known AI agent program (`claude`, `codex`, ...) or anything it started |
+| `remote` | Started through a remote login service such as `sshd`. Who is at the other end is not visible |
+| `human` | Typed in an interactive shell that a terminal started |
+| `automation` | Started by a scheduler, a service manager, the desktop itself or pid 1 |
+| `unknown` | The parents were not seen |
+
+`agent` and `remote` stick: an agent that opens a terminal keeps its label. `dnom audit`
+shows the label in the WHO column, and rules can use it (`driver == "agent"`). It is not
+sent to the model.
+
+The label describes and proves nothing: programs are matched by name, and a program can
+pick its name. A cron job that an agent wrote runs as `automation`. The name lists are
+under `drivers` in `dnom.yaml`.
 
 ## Quick start
 
@@ -164,6 +204,37 @@ make run                  # default backend: jev
 > never read or sent. `make run ONLY=<text>` limits it to matching commands, and a
 > self-hosted backend (`BACKEND=kev`, `BACKEND=local`) keeps everything local.
 
+### 4. In the background, for a day or more
+
+```bash
+make local-start          # asks for your password once
+make local-status         # alive? memory, CPU, episodes assessed
+make local-report         # every episode a rule matched
+make local-stop
+```
+
+One systemd unit, capped at 1 GB of memory and half a CPU core. It runs a copy of the binary
+and of `dnom.yaml` taken at start, keeps its own audit trail in `~/.local/state/dnom/trial/`,
+and does not come back after a reboot.
+
+### 5. A server: the sensor there, the judgment here
+
+```bash
+make remote-install HOST=<ssh alias>   # root, or a user with passwordless sudo
+make remote-status  HOST=<ssh alias>
+make remote-pull    HOST=<ssh alias>   # copy the events here and classify them
+make remote-remove  HOST=<ssh alias>   # stop it and delete everything there
+```
+
+Only the collector runs on the server, as a service capped at 128 MB of memory and a quarter
+of a CPU core. Classification, the config, the model key and the audit trail stay on your
+machine. On a small web server the collector used about 40 MB and wrote about 300 MB of
+events a day (one file per day, 7 days kept, 2 GB at most).
+
+> [!NOTE]
+> The event files on the server hold command lines as they were typed; masking happens at
+> classification. They are readable by root only. Treat them as sensitive.
+
 `make` lists every command.
 
 ## Policies
@@ -196,7 +267,7 @@ policies:
 | Model answers | `exfiltration >= 0.8`, `response == "contain"`, `response.alert > 0.5` |
 | File counts by category | `files.credentials`, `files.persistence`, `files.system_binaries`, `files.temp`, `files.decoys` |
 | Network | `net.new`, `net.total`, `net.decoys` |
-| Episode facts | `procs`, `uid`, `"new_exe" in flags` |
+| Episode facts | `procs`, `uid`, `"new_exe" in flags`, `driver` (`"agent"`, `"remote"`, `"human"`, `"automation"`, `"unknown"`) |
 | Container context (Falco source) | `container.name`, `container.image`, `k8s.pod`, `k8s.namespace` |
 | Logic | `and`, `or`, `not`, parentheses, `== != > >= < <=` |
 
@@ -325,9 +396,23 @@ Read these before trusting an alert, or the absence of one.
   cases are not in the test set yet.
 - **Masking is best effort.** Secrets with no recognisable shape, and secrets inside
   `sh -c "…"` scripts, can reach the model.
-- **False alarms are not measured yet** over hours of normal work. One known case is open:
-  a Kubernetes pod using its service-account token against the API server matches
-  `credentials-then-new-destination` on a fresh node.
+- **False alarms are measured for one day on two machines, no more.**
+  - A quiet web server: 1.85 million events, 38 assessed episodes, no rule matched.
+  - A developer desktop running AI coding agents: 8.8 million events, 317 assessed episodes,
+    10 false alarms. All 10 matched `credentials-then-new-destination`, and one of them also
+    matched a model rule. 7 were coding-agent sessions and 3 a desktop usage meter. Most came
+    in the first hours, while the baseline was new.
+  - Also known: a Kubernetes pod using its service-account token against the API server
+    matches the same rule on a fresh node.
+- **It sees addresses, not names.** A GitHub token going to GitHub and the same token going
+  anywhere else look alike: a credential read, then an address. The normal work of an AI
+  agent (read a credential, reach a new place) matches `credentials-then-new-destination`
+  for that reason.
+- **Detection is measured only on simulations** written for this project, not on real
+  intrusions.
+- **Routine reads trust a program's path.** The sensor reports the path a program was
+  started with. Root, or a process in its own mount namespace, can make another program
+  appear under `/usr/sbin/sshd`. Keep `routine.reads` to programs only root can replace.
 - **The built-in sensor has gaps:** x86_64 only, the first 8 arguments of a command, no
   `io_uring`, `sendmsg` or inbound connections, no reads under `/proc`. See
   [`lab/notes/event-inventory.md`](lab/notes/event-inventory.md).
@@ -338,7 +423,7 @@ Read these before trusting an alert, or the absence of one.
 
 | Command | What it checks |
 |---|---|
-| `make test` | 63 unit tests |
+| `make test` | 77 unit tests |
 | `make notify-test` | 6 webhook checks against a local listener (no root) |
 | `make vm-e2e` | 45 end-to-end checks in a lab VM: sensors, episodes, policies, decoys, audit, monitor |
 | `make vm-k3s` | 20 checks on k3s with Falco as a DaemonSet: pod labels, namespace-scoped rules, decoy addresses |
@@ -357,7 +442,7 @@ dnom-common/       types shared by both
 dnom.yaml          configuration: paths, decoys, policies, backends, questions
 integrations/      Falco catch-all rules
 scripts/           the harmless credential-theft simulation
-lab/               lab VM, end-to-end and Kubernetes tests, replay fixtures, notes
+lab/               lab VM, end-to-end and Kubernetes tests, background and remote runs, replay fixtures, notes
 docs/              diagrams
 ```
 
