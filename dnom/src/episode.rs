@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config,
+    driver::{Driver, Kind},
     event::{Container, Data, Event},
     paths,
 };
@@ -21,7 +22,7 @@ const FILES_CAP: usize = 15;
 const NET_CAP: usize = 15;
 const TRAIL_CAP: usize = 100;
 const TRIPWIRE_ROOM: usize = 20;
-const SHELLS: &[&str] = &["bash", "sh", "zsh", "fish", "dash", "ksh", "nu"];
+pub(crate) const SHELLS: &[&str] = &["bash", "sh", "zsh", "fish", "dash", "ksh", "nu"];
 const PACKAGE_MANAGERS: &[&str] = &[
     "npm", "npx", "node", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "cargo", "gem", "composer",
 ];
@@ -39,6 +40,8 @@ pub struct Proc {
     pub exited_ms: Option<u64>,
     /// Container the process runs in (None: the host, or unknown).
     pub container: Option<Container>,
+    /// Who drives this process (`driver.rs`): inherited from its parent, replaced by what it is.
+    pub driver: Driver,
 }
 
 pub struct TreeEntry {
@@ -81,6 +84,8 @@ pub struct Episode {
     pub root_argv: String,
     pub root_uid: u32,
     pub root_parent: String,
+    /// Who drives the episode: the root's driver, or `agent` once an agent program runs in it.
+    pub driver: Driver,
     pub tree: Vec<TreeEntry>,
     tree_pids: HashSet<u32>,
     pub tree_truncated: usize,
@@ -94,6 +99,9 @@ pub struct Episode {
     trail_seen: HashSet<(u32, String)>,
     pub trail_truncated: usize,
     pub flags: BTreeSet<String>,
+    /// Something sensitive happened that was not a routine read (`routine` in dnom.yaml):
+    /// a sensitive file opened by anything else, or a decoy.
+    pub beyond_routine: bool,
     /// Bumped on every meaningful change; compared with `assessed_version`.
     pub version: u64,
     pub assessed_version: u64,
@@ -130,9 +138,20 @@ impl Episode {
         self.version > self.assessed_version
     }
 
+    /// True if everything sensitive in this episode is a daemon reading its own files, and
+    /// the episode has contacted no new destination. Such an episode is not assessed for it.
+    pub fn only_routine_reads(&self) -> bool {
+        self.sensitive_count() > 0 && !self.beyond_routine && !self.flags.contains("new_destination")
+    }
+
+    /// Never assessed, and routine reads are the reason.
+    fn left_as_routine(&self) -> bool {
+        self.assessed_version == 0 && self.only_routine_reads()
+    }
+
     /// Cheap pre-filter (SPEC §4.4): only these episodes reach the model.
     pub fn passes_prefilter(&self, assess_new_destinations: bool) -> bool {
-        self.sensitive_count() > 0
+        (self.sensitive_count() > 0 && !self.only_routine_reads())
             || self.flags.contains("new_exe")
             || self.flags.contains("shell_from_package_manager")
             || self.flags.contains("sensitive_in_ignored_tree")
@@ -186,6 +205,7 @@ impl Episode {
                 "uid": self.root_uid,
                 "started_by": self.root_parent,
             },
+            "driver": self.driver.to_json(),
             "tree": tree,
             "files": files,
             "other_file_opens": self.other_opens,
@@ -220,9 +240,11 @@ impl Episode {
 ///   independent check on the alert.
 /// - `decoy_destinations`: a decoy address stays in `network` like any other destination.
 /// - the audit trail and the tree's `ppid` / `ts_ms`.
+/// - `driver`: a label made from names the model already sees, kept as an independent check.
 pub fn model_view(episode: &Value) -> Value {
     let mut v = episode.clone();
     if let Some(o) = v.as_object_mut() {
+        o.remove("driver");
         o.remove("trail");
         o.remove("trail_truncated");
         o.remove("decoy_destinations");
@@ -286,6 +308,8 @@ pub struct Tracker {
     /// Look up processes we haven't seen fork in this machine's /proc. Off when the events
     /// come from another machine (a VM), where these pids mean something else.
     local_proc: bool,
+    /// Closed episodes that were never assessed because all they did was routine reads.
+    routine_closed: u64,
 }
 
 impl Tracker {
@@ -302,6 +326,7 @@ impl Tracker {
             learn_until_ms,
             own_exe: std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()),
             local_proc: true,
+            routine_closed: 0,
         }
     }
 
@@ -386,11 +411,26 @@ impl Tracker {
             .find(|r| r.matches(&exe, &comm, &argv_joined))
             .map(|r| r.name.clone());
         let parent_name = self.parent_name(pid);
+        let parent_names = self
+            .procs
+            .get(&pid)
+            .and_then(|p| p.ppid)
+            .and_then(|pp| self.procs.get(&pp))
+            .map(|pp| (pp.comm.clone(), pp.exe.clone()));
         let Some(p) = self.procs.get_mut(&pid) else { return };
         let ppid = p.ppid;
         p.exe = exe.clone();
         p.argv = argv.clone();
         p.comm = comm.clone();
+        // The program it runs now can change who drives it: a shell in a terminal, an agent.
+        p.driver = self.config.drivers.of(
+            &p.driver,
+            &comm,
+            &exe,
+            is_interactive_shell(&comm, &argv),
+            parent_names.as_ref().map(|(c, e)| (c.as_str(), e.as_str())),
+        );
+        let driver = p.driver.clone();
         if p.ignored.is_none() {
             p.ignored = rule;
         }
@@ -415,6 +455,10 @@ impl Tracker {
             // The root's exec defines what the episode is (a forked shell child that runs curl).
             ep.root_exe = exe.clone();
             ep.root_argv = cap(&shown_argv);
+        }
+        // An agent program anywhere in the tree makes it an agent's episode.
+        if pid == root || (driver.kind == Kind::Agent && ep.driver.kind != Kind::Agent) {
+            ep.driver = driver;
         }
         push_tree(ep, pid, ppid, ts, &exe, &shown_argv, &parent_name, true);
         if is_new_exe && !learning {
@@ -448,8 +492,15 @@ impl Tracker {
             .tripwire(&path)
             .filter(|t| *t != paths::OWN_CONFIG || self.own_exe.as_deref() != Some(p.exe.as_str()));
         let sensitive = tripwire.is_some() || category.is_some_and(paths::is_sensitive);
+        // A daemon reading its own files: kept in the record, but not a signal. Never a write,
+        // a tripwire, or a process in a container (its root can replace the container's programs).
+        let routine = sensitive
+            && !write
+            && tripwire.is_none()
+            && p.container.is_none()
+            && self.config.routine.covers(&p.exe, &path);
         let ignored = p.ignored.clone();
-        if ignored.is_some() && !sensitive {
+        if ignored.is_some() && (!sensitive || routine) {
             return;
         }
         let root = p.root;
@@ -458,6 +509,9 @@ impl Tracker {
         ep.last_ms = ep.last_ms.max(ts);
         if ignored.is_some() {
             ep.flags.insert("sensitive_in_ignored_tree".into());
+        }
+        if sensitive && !routine {
+            ep.beyond_routine = true;
         }
         // A tripwire file is listed as one and also under its normal category, like any other.
         if let Some(kind) = tripwire {
@@ -503,6 +557,9 @@ impl Tracker {
         if ignored {
             ep.flags.insert("sensitive_in_ignored_tree".into());
         }
+        if decoy {
+            ep.beyond_routine = true;
+        }
         if decoy && ep.decoy_net.len() < NET_CAP && ep.decoy_net.insert(dest.clone()) {
             ep.mark_changed(ts);
         }
@@ -527,9 +584,8 @@ impl Tracker {
         // Forked since dnom started: we know the parent from the fork event. Otherwise /proc.
         let forked_from = self.parent_of.get(&pid).copied();
         let proc_info = if forked_from.is_some() || !self.local_proc { None } else { read_proc(pid) };
-        let ppid = forked_from
-            .or(proc_info.as_ref().and_then(|i| i.ppid))
-            .filter(|&pp| pp > 1 && pp != pid);
+        let seen_ppid = forked_from.or(proc_info.as_ref().and_then(|i| i.ppid));
+        let ppid = seen_ppid.filter(|&pp| pp > 1 && pp != pid);
         if let Some(pp) = ppid
             && depth < 64
         {
@@ -585,9 +641,22 @@ impl Tracker {
                 .find(|r| r.matches(&exe, &comm, &argv_joined))
                 .map(|r| r.name.clone())
         });
+        // A child of pid 1 is a system service (or an orphan that was handed to it).
+        let inherited = match parent {
+            Some(parent) => parent.driver.clone(),
+            None if seen_ppid == Some(1) => Driver::from_init(),
+            None => Driver::default(),
+        };
+        let driver = self.config.drivers.of(
+            &inherited,
+            &comm,
+            &exe,
+            is_interactive_shell(&comm, &argv),
+            parent.map(|p| (p.comm.as_str(), p.exe.as_str())),
+        );
         self.procs.insert(
             pid,
-            Proc { ppid, exe, argv, comm, uid, root, ignored, exited_ms: None, container },
+            Proc { ppid, exe, argv, comm, uid, root, ignored, exited_ms: None, container, driver },
         );
     }
 
@@ -627,10 +696,10 @@ impl Tracker {
             return;
         }
         let parent_name = self.parent_name(root);
-        let (exe, argv, uid, container, ppid) = self
+        let (exe, argv, uid, container, ppid, driver) = self
             .procs
             .get(&root)
-            .map(|p| (p.exe.clone(), self.config.redact.redact_argv(&p.argv), p.uid, p.container.clone(), p.ppid))
+            .map(|p| (p.exe.clone(), self.config.redact.redact_argv(&p.argv), p.uid, p.container.clone(), p.ppid, p.driver.clone()))
             .unwrap_or_default();
         let mut ep = Episode {
             id: format!("ep-{root}-{:05x}", ts & 0xfffff),
@@ -642,6 +711,7 @@ impl Tracker {
             root_argv: cap(&argv),
             root_uid: uid,
             root_parent: parent_name.clone(),
+            driver,
             tree: Vec::new(),
             tree_pids: HashSet::new(),
             tree_truncated: 0,
@@ -653,6 +723,7 @@ impl Tracker {
             trail_seen: HashSet::new(),
             trail_truncated: 0,
             flags: BTreeSet::new(),
+            beyond_routine: false,
             version: 0,
             assessed_version: 0,
             first_unassessed_ms: None,
@@ -662,13 +733,25 @@ impl Tracker {
         self.episodes.insert(root, ep);
     }
 
+    /// Episodes so far, closed or still open, that were not assessed because all they did
+    /// was routine reads.
+    pub fn routine_episodes(&self) -> u64 {
+        self.routine_closed + self.episodes.values().filter(|ep| ep.left_as_routine()).count() as u64
+    }
+
     /// Closes idle or old episodes and forgets processes that exited a while ago.
     pub fn gc(&mut self, now_ms: u64, idle_ms: u64, max_life_ms: u64) -> usize {
         let before = self.episodes.len();
+        let mut routine = 0;
         self.episodes.retain(|_, ep| {
-            now_ms.saturating_sub(ep.last_ms) < idle_ms
-                && now_ms.saturating_sub(ep.start_ms) < max_life_ms
+            let keep = now_ms.saturating_sub(ep.last_ms) < idle_ms
+                && now_ms.saturating_sub(ep.start_ms) < max_life_ms;
+            if !keep && ep.left_as_routine() {
+                routine += 1;
+            }
+            keep
         });
+        self.routine_closed += routine;
         self.procs
             .retain(|_, p| p.exited_ms.is_none_or(|t| now_ms.saturating_sub(t) < 30_000));
         if self.parent_of.len() > 200_000 {
@@ -763,7 +846,7 @@ fn is_local_dest(dest: &str) -> bool {
 /// True if a shell's arguments look like an interactive session: only options, and no
 /// `-c` (alone or in a cluster like `-lc`). A plain argument is a script to run.
 /// Unknown argv (process seen only through events) counts as interactive.
-fn is_interactive_shell_argv(argv: &[String]) -> bool {
+pub(crate) fn is_interactive_shell_argv(argv: &[String]) -> bool {
     argv.iter().skip(1).all(|a| {
         if let Some(long) = a.strip_prefix("--") {
             long != "command"
@@ -773,6 +856,11 @@ fn is_interactive_shell_argv(argv: &[String]) -> bool {
             false
         }
     })
+}
+
+/// A shell that waits for typed commands (see `is_interactive_shell_argv`).
+fn is_interactive_shell(comm: &str, argv: &[String]) -> bool {
+    SHELLS.contains(&comm) && is_interactive_shell_argv(argv)
 }
 
 pub fn basename(path: &str) -> &str {
@@ -989,6 +1077,156 @@ mod tests {
         Data::Exec { exe: exe.into(), argv: argv.iter().map(|s| s.to_string()).collect() }
     }
 
+    fn open(path: &str) -> Data {
+        Data::Open { path: path.into(), flags: 0, write: false }
+    }
+
+    /// Seen on a public server: every connection is an sshd that reads its host keys and
+    /// /etc/shadow, every cron job a cron child that reads /etc/shadow. Recorded, not assessed.
+    #[test]
+    fn daemons_reading_their_own_files_are_routine() {
+        let mut t = Tracker::new(Config::default(), Baseline::default(), u64::MAX).remote();
+        let (listener, conn, cron, job) = (4_191_001, 4_191_002, 4_191_003, 4_191_004);
+        t.ingest(ev(0, listener, 0, "sshd", exec("/usr/sbin/sshd", &["sshd", "-D"])));
+        t.ingest(ev(1, listener, 0, "sshd", Data::Fork { child: conn }));
+        t.ingest(ev(2, conn, 0, "sshd", exec("/usr/sbin/sshd", &["/usr/sbin/sshd", "-D", "-R"])));
+        t.ingest(ev(3, conn, 0, "sshd", open("/etc/ssh/ssh_host_ed25519_key")));
+        t.ingest(ev(4, conn, 0, "sshd", open("/etc/shadow")));
+        t.ingest(ev(5, conn, 0, "sshd", Data::Net { op: "connect".into(), dest: "0.0.0.0:22".into() }));
+        let ep = &t.episodes[&conn];
+        assert!(ep.only_routine_reads() && !ep.passes_prefilter(false), "sshd and its own files");
+        assert_eq!(ep.to_json("/root")["files"]["credentials"], json!(["/etc/shadow", "/etc/ssh/ssh_host_ed25519_key"]), "still on record");
+
+        // A cron job: the child that reads /etc/shadow never execs, it is still cron.
+        t.ingest(ev(10, cron, 0, "cron", exec("/usr/sbin/cron", &["/usr/sbin/cron", "-f", "-P"])));
+        t.ingest(ev(11, cron, 0, "cron", Data::Fork { child: job }));
+        t.ingest(ev(12, job, 0, "cron", open("/etc/shadow")));
+        assert!(!t.episodes[&job].passes_prefilter(false), "cron and /etc/shadow");
+        assert_eq!(t.routine_episodes(), 2);
+
+        // Closed without assessment, they stay counted; the count is what a run reports.
+        t.gc(1_000_000, 1000, 600_000);
+        assert!(t.episodes.is_empty());
+        assert_eq!(t.routine_episodes(), 2);
+    }
+
+    /// The exemption is narrow: the same file read by another program, another sensitive file,
+    /// a write, a decoy, a new destination or a container, and the episode is assessed in full.
+    #[test]
+    fn anything_beyond_a_routine_read_is_assessed() {
+        let sshd_reads = |t: &mut Tracker, pid: u32, path: &str| {
+            t.ingest(ev(0, pid, 0, "sshd", exec("/usr/sbin/sshd", &["/usr/sbin/sshd", "-D", "-R"])));
+            t.ingest(ev(1, pid, 0, "sshd", open(path)));
+        };
+        let pid = 4_191_101;
+
+        // Another program reads the daemon's file.
+        let mut t = Tracker::new(Config::default(), Baseline::default(), u64::MAX).remote();
+        t.ingest(ev(0, pid, 0, "cat", exec("/usr/bin/cat", &["cat", "/etc/shadow"])));
+        t.ingest(ev(1, pid, 0, "cat", open("/etc/shadow")));
+        assert!(t.episodes[&pid].passes_prefilter(false), "cat is not sshd");
+
+        // A program that only carries the daemon's name.
+        let mut t = Tracker::new(Config::default(), Baseline::default(), u64::MAX).remote();
+        t.ingest(ev(0, pid, 0, "sshd", exec("/tmp/sshd", &["sshd"])));
+        t.ingest(ev(1, pid, 0, "sshd", open("/etc/shadow")));
+        assert!(t.episodes[&pid].passes_prefilter(false), "matched by full path, not by name");
+
+        // The daemon reads something that is not its own, next to its routine reads.
+        let mut t = Tracker::new(Config::default(), Baseline::default(), u64::MAX).remote();
+        sshd_reads(&mut t, pid, "/etc/shadow");
+        assert!(!t.episodes[&pid].passes_prefilter(false));
+        t.ingest(ev(2, pid, 0, "sshd", open("/root/.aws/credentials")));
+        let ep = &t.episodes[&pid];
+        assert!(ep.passes_prefilter(false) && !ep.only_routine_reads());
+        assert_eq!(ep.to_json("/root")["files"]["credentials"], json!(["/etc/shadow", "~/.aws/credentials"]), "routine reads included");
+        assert_eq!(t.routine_episodes(), 0);
+
+        // A write is never routine.
+        let mut t = Tracker::new(Config::default(), Baseline::default(), u64::MAX).remote();
+        t.ingest(ev(0, pid, 0, "sshd", exec("/usr/sbin/sshd", &["/usr/sbin/sshd", "-D", "-R"])));
+        t.ingest(ev(1, pid, 0, "sshd", Data::Open { path: "/etc/shadow".into(), flags: 1, write: true }));
+        assert!(t.episodes[&pid].passes_prefilter(false), "sshd writing /etc/shadow");
+
+        // A decoy placed on a routine path still trips.
+        let mut config = Config::default();
+        config.paths.decoys = vec!["/etc/ssh/ssh_host_dsa_key".into()];
+        let mut t = Tracker::new(config, Baseline::default(), u64::MAX).remote();
+        sshd_reads(&mut t, pid, "/etc/ssh/ssh_host_dsa_key");
+        assert!(t.episodes[&pid].passes_prefilter(false), "a decoy is a tripwire for everyone");
+
+        // Routine reads count again once the episode contacts a new destination
+        // (learning is over here, so the destination is new).
+        let mut t = Tracker::new(Config::default(), Baseline::default(), 0).remote();
+        t.baseline.exes.insert("/usr/sbin/sshd".into());
+        sshd_reads(&mut t, pid, "/etc/shadow");
+        assert!(!t.episodes[&pid].passes_prefilter(false));
+        t.ingest(ev(2, pid, 0, "sshd", Data::Net { op: "connect".into(), dest: "203.0.113.7:443".into() }));
+        let ep = &t.episodes[&pid];
+        assert!(ep.flags.contains("new_destination") && ep.passes_prefilter(false), "credentials, then a new destination");
+
+        // In a container nothing is routine.
+        let mut t = Tracker::new(Config::default(), Baseline::default(), u64::MAX).remote();
+        t.ingest(in_container(ev(0, pid, 0, "sshd", exec("/usr/sbin/sshd", &["/usr/sbin/sshd", "-D", "-R"])), "web", None));
+        t.ingest(in_container(ev(1, pid, 0, "sshd", open("/etc/shadow")), "web", None));
+        assert!(t.episodes[&pid].passes_prefilter(false), "a container's root can replace its sshd");
+
+        // Built-ins can be switched off.
+        let config: Config = serde_saphyr::from_str("routine: {include_defaults: false}").unwrap();
+        let mut t = Tracker::new(config, Baseline::default(), u64::MAX).remote();
+        sshd_reads(&mut t, pid, "/etc/shadow");
+        assert!(t.episodes[&pid].passes_prefilter(false));
+    }
+
+    /// A deploy tool polls its repository: git starts ssh, ssh reads the deploy key. With the
+    /// key listed as a credential and as ssh's own file, the poll is routine, also inside an
+    /// ignored tree; anything else reading the key is not.
+    #[test]
+    fn custom_routine_read_inside_a_larger_tree() {
+        let yaml = r#"
+paths:
+  credentials: [/var/lib/app/keys/]
+routine:
+  reads:
+    - name: deploy-key
+      exe: /usr/bin/ssh
+      paths: [/var/lib/app/keys/]
+"#;
+        let poll = |t: &mut Tracker, reader_exe: &str| {
+            let (app, git, ssh) = (4_191_201, 4_191_202, 4_191_203);
+            t.ingest(ev(0, app, 0, "app", exec("/usr/local/bin/app", &["app", "serve"])));
+            t.ingest(ev(1, app, 0, "app", Data::Fork { child: git }));
+            t.ingest(ev(2, git, 0, "git", exec("/usr/bin/git", &["git", "fetch", "origin"])));
+            t.ingest(ev(3, git, 0, "git", Data::Fork { child: ssh }));
+            t.ingest(ev(4, ssh, 0, "ssh", exec(reader_exe, &["ssh", "-i", "/var/lib/app/keys/deploy", "git@example.org"])));
+            t.ingest(ev(5, ssh, 0, "ssh", open("/var/lib/app/keys/deploy")));
+            app
+        };
+        let config = || serde_saphyr::from_str::<Config>(yaml).unwrap();
+
+        let mut t = Tracker::new(config(), Baseline::default(), u64::MAX).remote();
+        let app = poll(&mut t, "/usr/bin/ssh");
+        let ep = &t.episodes[&app];
+        assert!(ep.only_routine_reads() && !ep.passes_prefilter(false), "ssh reading its deploy key");
+
+        let mut t = Tracker::new(config(), Baseline::default(), u64::MAX).remote();
+        let app = poll(&mut t, "/usr/bin/cat");
+        assert!(t.episodes[&app].passes_prefilter(false), "anything else reading the key");
+
+        // The same poll under an ignore rule: the routine read raises no flag, the other does.
+        let ignored = || {
+            let mut c = config();
+            c.ignore = vec![crate::config::IgnoreRule { name: "app".into(), exe: Some("/usr/local/bin/app".into()), exe_prefix: None, comm: None, argv_contains: None }];
+            c
+        };
+        let mut t = Tracker::new(ignored(), Baseline::default(), u64::MAX).remote();
+        let app = poll(&mut t, "/usr/bin/ssh");
+        assert!(!t.episodes.contains_key(&app), "ignored tree, routine read: nothing to record");
+        let mut t = Tracker::new(ignored(), Baseline::default(), u64::MAX).remote();
+        let app = poll(&mut t, "/usr/bin/cat");
+        assert!(t.episodes[&app].flags.contains("sensitive_in_ignored_tree"));
+    }
+
     #[test]
     fn custom_rules_reach_outbound_episode() {
         let config: Config = serde_saphyr::from_str(r#"
@@ -1025,6 +1263,63 @@ redact:
         let net = &t.episodes[&sshd].net;
         assert_eq!(net.len(), 2, "local destinations are still recorded");
         assert!(!net[0].new && net[1].new);
+    }
+
+    /// Who drives an episode comes from the process tree and stays out of the model's view.
+    #[test]
+    fn episodes_are_labelled_with_their_driver() {
+        let mut t = Tracker::new(Config::default(), Baseline::default(), 0).remote();
+        let driver = |t: &Tracker, root: u32| t.episodes[&root].to_json("/root")["driver"].clone();
+        let start = |t: &mut Tracker, parent: u32, pid: u32, comm: &str, exe: &str, argv: &[&str]| {
+            t.ingest(ev(0, parent, 1000, "", Data::Fork { child: pid }));
+            t.ingest(ev(1, pid, 1000, comm, exec(exe, argv)));
+        };
+        let (systemd, foot, bash, make, claude, tool, git) = (4_191_001, 4_191_002, 4_191_003, 4_191_004, 4_191_005, 4_191_006, 4_191_007);
+        start(&mut t, 1, systemd, "systemd", "/usr/lib/systemd/systemd", &["systemd", "--user"]);
+        start(&mut t, systemd, foot, "foot", "/usr/bin/foot", &["foot"]);
+        start(&mut t, foot, bash, "bash", "/usr/bin/bash", &["bash"]);
+
+        // Typed in a terminal.
+        start(&mut t, bash, make, "make", "/usr/bin/make", &["make", "test"]);
+        assert_eq!(driver(&t, make), json!({ "kind": "human", "by": "bash in foot" }));
+
+        // An agent started from that shell, and the commands it runs.
+        start(&mut t, bash, claude, "claude", "/home/u/.local/bin/claude", &["claude"]);
+        start(&mut t, claude, tool, "bash", "/usr/bin/bash", &["bash", "-c", "git status"]);
+        start(&mut t, tool, git, "git", "/usr/bin/git", &["git", "status"]);
+        assert_eq!(driver(&t, claude), json!({ "kind": "agent", "by": "claude" }));
+        assert_eq!(t.procs[&git].driver.kind, Kind::Agent);
+        assert!(!t.episodes.contains_key(&git), "the agent's commands stay in its episode");
+
+        // An agent started by a script turns that script's episode into an agent's.
+        let codex = 4_191_008;
+        start(&mut t, make, codex, "codex", "/usr/bin/codex", &["codex", "exec", "fix the tests"]);
+        assert_eq!(driver(&t, make), json!({ "kind": "agent", "by": "codex" }));
+
+        // A system service: started by pid 1.
+        let service = 4_191_010;
+        start(&mut t, 1, service, "bash", "/usr/bin/bash", &["bash", "/usr/bin/snapshot-sync"]);
+        assert_eq!(driver(&t, service), json!({ "kind": "automation", "by": "pid 1" }));
+
+        // A desktop timer.
+        let (shell_bar, meter) = (4_191_011, 4_191_012);
+        start(&mut t, systemd, shell_bar, "quickshell", "/usr/bin/quickshell", &["quickshell"]);
+        start(&mut t, shell_bar, meter, "bash", "/bin/bash", &["bash", "/usr/bin/usage-update"]);
+        assert_eq!(driver(&t, meter), json!({ "kind": "automation", "by": "quickshell" }));
+
+        // A command sent over SSH: someone on another machine.
+        let (sshd, session, remote) = (4_191_020, 4_191_021, 4_191_022);
+        start(&mut t, 1, sshd, "sshd", "/usr/sbin/sshd", &["sshd", "-D"]);
+        start(&mut t, sshd, session, "sshd-session", "/usr/lib/openssh/sshd-session", &["sshd-session: admin@notty"]);
+        start(&mut t, session, remote, "bash", "/usr/bin/bash", &["bash", "-c", "cat ~/.aws/credentials"]);
+        assert_eq!(driver(&t, remote), json!({ "kind": "remote", "by": "sshd-session" }));
+
+        // Parents never seen.
+        let orphan = 4_191_030;
+        t.ingest(ev(2, orphan, 1000, "python3", exec("/usr/bin/python3", &["python3", "x.py"])));
+        assert_eq!(driver(&t, orphan), json!({ "kind": "unknown" }));
+
+        assert!(model_view(&t.episodes[&claude].to_json("/root")).get("driver").is_none());
     }
 
     #[test]

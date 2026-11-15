@@ -5,6 +5,7 @@ mod classify;
 mod collect;
 mod config;
 mod decoys;
+mod driver;
 mod episode;
 mod event;
 mod falco;
@@ -13,6 +14,7 @@ mod paths;
 mod policy;
 mod questions;
 mod redact;
+mod routine;
 
 use clap::{Parser, Subcommand};
 

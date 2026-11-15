@@ -8,7 +8,9 @@
 //! Fields: every question id (noul/score: number, choice: chosen option as a string,
 //! `<choice>.<option>`: that option's probability), plus episode facts: `flags` (list),
 //! `files.credentials` / `files.persistence` / `files.system_binaries` / `files.temp` /
-//! `files.decoys` / `files.dnom_config` (counts), `net.new` / `net.total` / `net.decoys` (destination counts), `procs`, `uid`, and, when the
+//! `files.decoys` / `files.dnom_config` (counts), `net.new` / `net.total` / `net.decoys` (destination counts), `procs`, `uid`,
+//! `driver` (who drives the episode: "agent", "remote", "human", "automation" or "unknown", see
+//! `driver.rs`), and, when the
 //! source knows them (Falco), `container.name`, `container.image`, `k8s.pod`, `k8s.namespace`.
 //! A rule that needs a value the episode doesn't have (no backend, a failed call, a host
 //! episode for a container field) does not match.
@@ -415,6 +417,7 @@ impl FieldTypes {
             // Free text: any string literal is allowed (an empty option list skips the typo check).
             m.insert(f.to_string(), Ty::Choice(Vec::new()));
         }
+        m.insert("driver".into(), Ty::Choice(crate::driver::Kind::NAMES.iter().map(|k| k.to_string()).collect()));
         m.insert("flags".into(), Ty::List);
         Self(m)
     }
@@ -511,6 +514,7 @@ impl Ctx<'_> {
             ),
             "procs" => Val::Num(count(&ep["tree"])),
             "uid" => ep["root"]["uid"].as_f64().map_or(Val::Missing, Val::Num),
+            "driver" => ep["driver"]["kind"].as_str().map_or(Val::Missing, |k| Val::Str(k.to_string())),
             f if let Some((_, key)) = EPISODE_STRINGS.iter().find(|(name, _)| *name == f) => {
                 match ep["container"][key].as_str() {
                     Some(s) if !s.is_empty() => Val::Str(s.to_string()),
@@ -727,6 +731,20 @@ rules:
         assert_eq!(hits[0].values, [("credential_access".into(), "0.90".into()), ("fits_baseline".into(), "0.20".into())]);
         // Missing answers never make `not` true.
         assert!(p.evaluate(&episode("/x", &[], false, &[]), None).is_empty());
+    }
+
+    #[test]
+    fn rules_can_depend_on_who_drives_the_episode() {
+        let p = policies("rules:\n  - { name: agent-reads-credentials, when: 'driver == \"agent\" and files.credentials > 0', actions: [alert] }\n").unwrap();
+        let mut ep = episode("/usr/bin/cat", &["/home/u/.aws/credentials"], false, &[]);
+        assert!(p.evaluate(&ep, None).is_empty(), "a record without the label matches no driver rule");
+        ep["driver"] = json!({ "kind": "human", "by": "bash in foot" });
+        assert!(p.evaluate(&ep, None).is_empty());
+        ep["driver"] = json!({ "kind": "agent", "by": "claude" });
+        assert_eq!(names(&p.evaluate(&ep, None)), ["agent-reads-credentials"]);
+        // A kind that does not exist is a typo, caught when the rules are loaded.
+        let typo = policies("rules:\n  - { name: x, when: 'driver == \"robot\"', actions: [alert] }\n").unwrap_err();
+        assert!(typo.to_string().contains("not an option"), "{typo}");
     }
 
     #[test]

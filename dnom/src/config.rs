@@ -34,9 +34,15 @@ pub struct Config {
     /// Process trees that are not sent to the model.
     #[serde(default)]
     pub ignore: Vec<IgnoreRule>,
+    /// Daemons reading the files of their own job: recorded, but not a reason to assess.
+    #[serde(default)]
+    pub routine: crate::routine::RoutineConfig,
     /// A process whose parent has one of these names (comm or exe basename) starts a new episode.
     #[serde(default = "default_boundaries")]
     pub boundaries: Vec<String>,
+    /// Program names that say who drives an episode: an agent, a remote login, a terminal, a scheduler.
+    #[serde(default)]
+    pub drivers: crate::driver::DriverConfig,
 }
 
 impl Default for Config {
@@ -51,7 +57,9 @@ impl Default for Config {
             backend: crate::backends::default_backend(),
             backends: crate::backends::default_backends(),
             ignore: Vec::new(),
+            routine: Default::default(),
             boundaries: default_boundaries(),
+            drivers: Default::default(),
         }
     }
 }
@@ -153,6 +161,7 @@ pub fn load(path: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)> {
             .redact
             .validate()
             .with_context(|| format!("{}: redaction rules", candidate.display()))?;
+        config.routine.validate().with_context(|| format!("{}", candidate.display()))?;
         config
             .assessment
             .validate()
@@ -280,6 +289,7 @@ redact:
         let c: Config = serde_saphyr::from_str(include_str!("../../dnom.yaml")).unwrap();
         c.paths.validate().unwrap();
         c.redact.validate().unwrap();
+        c.routine.validate().unwrap();
         c.assessment.validate().unwrap();
         crate::backends::validate(&c.backend, &c.backends).unwrap();
     }

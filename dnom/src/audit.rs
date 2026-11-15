@@ -221,9 +221,16 @@ fn find<'a>(records: &'a [Value], wanted: &str, threats_only: bool) -> anyhow::R
 
 // --- rendering -----------------------------------------------------------------------------
 
-/// One line per episode: when, id, result, where, command.
+/// Who drives the episode (`driver.rs`), as `agent (claude)`. A record from before the label
+/// existed gets one from what it holds.
+fn driver_of(ep: &Value, with_evidence: bool) -> String {
+    let driver = crate::driver::DriverConfig::default().of_record(ep);
+    if with_evidence && !driver.by.is_empty() { format!("{} ({})", driver.kind.name(), driver.by) } else { driver.kind.name().to_string() }
+}
+
+/// One line per episode: when, id, result, who drives it, where, command.
 fn render_list(records: &[&Value], paint: &Paint, width: usize) -> String {
-    let rows: Vec<[String; 5]> = records
+    let rows: Vec<[String; 6]> = records
         .iter()
         .map(|r| {
             let rules = rules_of(r);
@@ -234,31 +241,40 @@ fn render_list(records: &[&Value], paint: &Paint, width: usize) -> String {
             };
             let command = r["episode"]["root"]["argv"].as_str().filter(|a| !a.is_empty());
             let command = command.or(r["episode"]["root"]["exe"].as_str()).unwrap_or("").to_string();
-            [local(record_ms(r), "%m-%d %H:%M:%S"), id_of(r).to_string(), clip(&result, 44), clip(&place(&r["episode"], true), 28), command]
+            [
+                local(record_ms(r), "%m-%d %H:%M:%S"),
+                id_of(r).to_string(),
+                clip(&result, 44),
+                driver_of(&r["episode"], false),
+                clip(&place(&r["episode"], true), 28),
+                command,
+            ]
         })
         .collect();
     let col = |i: usize, title: &str| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0).max(title.len());
-    let titles = ["WHEN", "EPISODE", "RESULT", "WHERE", "COMMAND"];
-    let widths: Vec<usize> = (0..4).map(|i| col(i, titles[i])).collect();
-    let used: usize = widths.iter().sum::<usize>() + 2 * 4;
+    let titles = ["WHEN", "EPISODE", "RESULT", "WHO", "WHERE", "COMMAND"];
+    let widths: Vec<usize> = (0..5).map(|i| col(i, titles[i])).collect();
+    let used: usize = widths.iter().sum::<usize>() + 2 * 5;
     let command_width = width.saturating_sub(used).max(20);
 
     let mut o = String::new();
-    let head: Vec<String> = (0..4).map(|i| format!("{:<w$}", titles[i], w = widths[i])).collect();
-    let _ = writeln!(o, "{}", paint.dim(&format!("{}  {}", head.join("  "), titles[4])));
+    let head: Vec<String> = (0..5).map(|i| format!("{:<w$}", titles[i], w = widths[i])).collect();
+    let _ = writeln!(o, "{}", paint.dim(&format!("{}  {}", head.join("  "), titles[5])));
     for row in &rows {
         let result = format!("{:<w$}", row[2], w = widths[2]);
         let result = if row[2] == "ok" { paint.dim(&result) } else { paint.red(&result) };
         let _ = writeln!(
             o,
-            "{:<w0$}  {:<w1$}  {result}  {:<w3$}  {}",
+            "{:<w0$}  {:<w1$}  {result}  {:<w3$}  {:<w4$}  {}",
             row[0],
             row[1],
             row[3],
-            clip(&row[4], command_width),
+            row[4],
+            clip(&row[5], command_width),
             w0 = widths[0],
             w1 = widths[1],
             w3 = widths[3],
+            w4 = widths[4],
         );
     }
     o
@@ -306,6 +322,7 @@ pub fn render(record: &Value, paint: &Paint) -> String {
         ep["root"]["uid"].as_u64().map_or("?".to_string(), |u| u.to_string()),
         started_by.map(|s| format!(", started by {s}")).unwrap_or_default()
     );
+    let _ = writeln!(o, "  driver    {}", driver_of(ep, true));
     let _ = writeln!(o, "  command   {}", ep["root"]["argv"].as_str().unwrap_or(""));
 
     if !policy.is_empty() {
@@ -826,7 +843,7 @@ mod tests {
         let list = render_list(&refs, &PLAIN, 200);
         let lines: Vec<&str> = list.lines().collect();
         assert!(lines[0].starts_with("WHEN") && lines[0].ends_with("COMMAND"), "{list}");
-        assert!(lines[1].contains("ep-2-b   THREAT decoy-touched  web · dnom-test  sh -c cat keys"), "{list}");
+        assert!(lines[1].contains("ep-2-b   THREAT decoy-touched  unknown  web · dnom-test  sh -c cat keys"), "{list}");
         assert!(lines[2].contains("ep-1-a   THREAT x +1"), "{list}");
         // A narrower terminal clips the command, never the other columns.
         let narrow = render_list(&refs, &PLAIN, 100);

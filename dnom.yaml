@@ -11,6 +11,21 @@ ignore:
   - name: omaestro
     exe_prefix: /home/iluxa/.local/share/omaestro/
 
+# Routine reads: a daemon reading the files of its own job. Built in: sshd reading
+# its host keys and /etc/shadow (every connection does), cron reading /etc/shadow
+# (every job does). Such a read stays in the episode's record but is not a reason
+# to assess it; it counts again once the episode contacts a new destination.
+# Never routine: a write, a decoy, a process in a container, or the same file read
+# by any other program.
+# Add your own under `reads`: exe is the program's exact path (in a place only root
+# can write), paths are files, directories (ending in /) or prefixes (ending in *).
+# `include_defaults: false` switches the built-in ones off.
+# routine:
+#   reads:
+#     - name: deploy-key
+#       exe: /usr/bin/ssh
+#       paths: [/var/lib/myapp/keys/]
+
 # A process whose parent has one of these names starts its own episode.
 # A shell started directly by one of these counts as interactive: each command
 # typed in it is its own episode.
@@ -125,6 +140,16 @@ redact:
 # actions: alert, kill_tree, block_net, quarantine_exe (reported only).
 # protected: programs whose episodes would never get anything but alert.
 # Typos (unknown fields, options that don't exist) stop classify at startup.
+# Who drives an episode: its `driver` label (agent, remote, human, automation, unknown),
+# shown by `dnom audit` and usable in rules (`driver == "agent"`). Made from program names
+# (process name, or the executable's file name) in the process tree; not sent to the model.
+# A list given here replaces the built-in one, so repeat the names you want to keep.
+# drivers:
+#   agents: [claude, codex, aider, gemini, opencode, goose, amp, cursor-agent, copilot, crush, qwen, openhands]
+#   remote: [sshd, sshd-session, dropbear, mosh-server]
+#   terminals: [foot, footclient, alacritty, kitty, ghostty, wezterm-gui, gnome-terminal-server, konsole, xterm, "tmux: server", zellij, screen, login, desl]
+#   automation: [systemd, init, cron, crond, atd, anacron, quickshell, Hyprland, start-hyprland, uwsm, gitlab-runner, Runner.Worker, Runner.Listener]
+
 policies:
   dry_run: true
   protected: [sshd, sshd-session, systemd, init, dnom, falco]

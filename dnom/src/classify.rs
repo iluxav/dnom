@@ -290,6 +290,10 @@ pub fn run(args: ClassifyArgs) -> anyhow::Result<()> {
     }
     tracker.baseline.save(&baseline_path)?;
     let (exes, dests) = tracker.baseline.len();
+    let routine = tracker.routine_episodes();
+    if routine > 0 {
+        eprintln!("dnom classify: {assessed_total} assessed, {routine} left out as routine reads (a daemon reading its own files)");
+    }
     eprintln!(
         "dnom classify: stopped. baseline saved ({exes} exes, {dests} destinations), log: {}",
         log_path.display()
@@ -326,6 +330,10 @@ fn status(tracker: &Tracker, counts: &EventCounts, assessed: u64, now_ms: u64) {
          {not_sent} filtered out | {assessed} assessed",
         counts.total, counts.exec, counts.open, counts.net
     );
+    let routine = tracker.routine_episodes();
+    if routine > 0 {
+        line.push_str(&format!(" | {routine} routine"));
+    }
     let tokens = INPUT_TOKENS.load(Ordering::Relaxed);
     if tokens > 0 {
         line.push_str(&format!(" | {tokens} input tokens"));
